@@ -1,0 +1,445 @@
+#!/usr/bin/env bash
+# walkthrough — play guided code tours in nvim.
+set -uo pipefail
+
+# ---------------------------------------------------------------------------
+# Threat model, because it shapes almost every line below.
+#
+# A .tour file is meant to be committed to a repository and shared. Playing a
+# tour from a repo you cloned must therefore not run its author's code — which
+# means BOTH the tour's contents AND its FILENAME are untrusted input.
+#
+# That single fact rules out the obvious implementation. Pasting a path into a
+# Lua chunk, a vimscript expression, or a shell-sourced state file are all the
+# same mistake wearing three hats, and escaping is the wrong fix: three nested
+# languages means three sets of escaping rules that have to agree. Instead,
+# untrusted text never becomes source code here:
+#
+#   1. Lua receives paths through argv (_G.arg) — see lua/walkthrough/validate.lua.
+#   2. Everything crossing the --remote-expr boundary is base64. Base64 output
+#      is [A-Za-z0-9+/=] only, so it cannot terminate a quote in shell, in
+#      vimscript, or in Lua, and is turned back into data by vim.base64.decode
+#      on the far side.
+#   3. The state file stores base64 values and is PARSED, never sourced.
+# ---------------------------------------------------------------------------
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# wt_require_backend (backends/common.sh) resolves its own root from
+# ${BASH_SOURCE[0]:-$0} at call time. If a caller changes directory between
+# sourcing this script and calling into it, that resolution can drift and
+# falsely report "no backend" even though the backend file exists.
+# WALKTHROUGH_ROOT is the escape hatch: pin it to the root we already
+# computed so the lookup can never drift.
+export WALKTHROUGH_ROOT="$ROOT"
+. "$ROOT/backends/common.sh"
+
+die() { echo "walkthrough: $*" >&2; exit 1; }
+
+# base64 is the armour for every value that has to cross into another
+# language. Encoding strips the newlines GNU/BSD base64 insert at 76 columns so
+# a value is always exactly one token on one line. The one implementation lives
+# in backends/common.sh (wt_b64), because the backend launch command needs the
+# same armour and the two must not drift apart.
+b64() { wt_b64 "$1"; }
+# GNU base64 uses -d; older macOS base64 only understands -D. Try both.
+unb64() {
+  printf %s "$1" | base64 -d 2>/dev/null || printf %s "$1" | base64 -D 2>/dev/null
+}
+
+# Resolve to an absolute path with the `cd` result CHECKED. The old code did
+# this inline and ignored a failed cd, so `reload` run from another directory
+# silently rewrote the tour path to /<basename> and reloaded the wrong file.
+#
+# It reports failure by RETURNING, not by calling die: every caller invokes
+# this inside a command substitution, and an exit there only ever ends the
+# subshell — the caller carried on with an empty path and asked the player to
+# open it. The abort has to happen in the caller, so every call site is
+# `x="$(wt_abspath ...)" || exit 1`.
+wt_abspath() {
+  local dir base
+  dir="$(dirname "$1")"; base="$(basename "$1")"
+  dir="$(cd "$dir" 2>/dev/null && pwd)" \
+    || { echo "walkthrough: cannot resolve directory of: $1" >&2; return 1; }
+  printf '%s/%s\n' "$dir" "$base"
+}
+
+# The directory a tour's `file` entries are relative to.
+#
+# CodeTour paths are relative to the WORKSPACE ROOT, and the workspace is where
+# the caller is working -- this CLI's invocation context. The .tour file's own
+# location says nothing about it: a durable tour is stored next to what it
+# explains (`src/auth/.tours/how-auth-works.tour`) to signal ownership and
+# discoverability, and a throwaway tour is written to a temp directory outside
+# the repository altogether. Both carry repo-root-relative paths, so neither
+# directory is a base worth consulting.
+#
+# The git root, not the invocation directory itself, because an agent's cwd is
+# unpredictable: `walkthrough open` has to work from anywhere in the tree. When
+# there is no repository the invocation directory is the best root available,
+# which is also what a bare directory of files deserves.
+#
+# git prints this path; treat it as data like any other path -- it may contain
+# spaces or quotes, and it is base64-armoured before it crosses into vimscript.
+# GIT_DIR and GIT_WORK_TREE are cleared for the query. Set together they
+# redirect `rev-parse --show-toplevel` at a repository that is not the one the
+# caller is standing in, so an inherited pair (a git hook, an alias, a stale
+# export) would silently move the whole workspace out from under the tour. Not
+# an execution risk -- the value stays base64-armoured and is only ever a chdir
+# target -- but the answer to "which repository am I in?" should come from the
+# directory, which is what the fallback below already assumes.
+wt_workspace_root() {
+  local root
+  root="$(env -u GIT_DIR -u GIT_WORK_TREE git rev-parse --show-toplevel 2>/dev/null)"
+  [ -n "$root" ] && [ -d "$root" ] || root="$PWD"
+  printf '%s\n' "$root"
+}
+
+load_backend() {
+  BACKEND="$(wt_detect_backend)"
+  # The backend name indexes a file we are about to source. Anything outside
+  # this alphabet (a `/`, a `..`) would let an environment variable pick an
+  # arbitrary file to execute.
+  [[ "$BACKEND" =~ ^[a-z0-9_]+$ ]] || die "invalid backend name: $BACKEND"
+  wt_require_backend "$BACKEND" || exit 1
+  # shellcheck disable=SC1090
+  . "$ROOT/backends/$BACKEND.sh"
+}
+
+# ---------------------------------------------------------------------------
+# The state file
+#
+# It names a live walkthrough and is read back by every step/reload/close. It
+# used to be `${XDG_RUNTIME_DIR:-/tmp}/walkthrough-$USER.state`: a predictable
+# path in a world-writable directory, created with the default umask (0644),
+# opened with `>` (which follows symlinks), with no ownership check — and then
+# `.`-sourced, so whatever it contained ran as shell in the user's own session.
+# Another local user could pre-create it and get code execution on the victim's
+# next `walkthrough step`.
+#
+# Now: a 0700 directory we verify we own, and a file we parse rather than
+# execute, whose values are base64 so that no metacharacter — and no newline —
+# can survive into the parse.
+# ---------------------------------------------------------------------------
+STATE_DIR="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/walkthrough-${USER:-x}"
+STATE="$STATE_DIR/state"
+
+state_dir_ready() {
+  if [ -L "$STATE_DIR" ]; then die "state dir is a symlink, refusing: $STATE_DIR"; fi
+  if [ ! -d "$STATE_DIR" ]; then
+    (umask 077; mkdir -p "$STATE_DIR") || die "cannot create state dir: $STATE_DIR"
+  fi
+  if [ -L "$STATE_DIR" ]; then die "state dir is a symlink, refusing: $STATE_DIR"; fi
+  if [ ! -d "$STATE_DIR" ]; then die "state path is not a directory: $STATE_DIR"; fi
+  # -O is "owned by the effective uid". A directory someone else owns is one
+  # they can plant files in, and we are about to trust what is inside it.
+  if [ ! -O "$STATE_DIR" ]; then die "state dir is not owned by you, refusing: $STATE_DIR"; fi
+  chmod 700 "$STATE_DIR" 2>/dev/null || true
+}
+
+state_write() { # backend handle socket tour(absolute)
+  state_dir_ready
+  rm -f "$STATE"   # never write through a pre-existing symlink
+  ( umask 077
+    printf 'backend=%s\nhandle=%s\nsocket=%s\ntour=%s\n' \
+      "$(b64 "$1")" "$(b64 "$2")" "$(b64 "$3")" "$(b64 "$4")" > "$STATE"
+  ) || die "cannot write state: $STATE"
+}
+
+ST_backend=""; ST_handle=""; ST_socket=""; ST_tour=""
+
+# Parse. Never source. Each line is key=<base64>; anything else is corruption,
+# not a command.
+state_read() {
+  local line key val
+  ST_backend=""; ST_handle=""; ST_socket=""; ST_tour=""
+  if [ ! -O "$STATE" ]; then die "state file is not owned by you, refusing: $STATE"; fi
+  while IFS= read -r line || [ -n "$line" ]; do
+    key="${line%%=*}"; val="${line#*=}"
+    case "$key" in backend|handle|socket|tour) ;; *) continue ;; esac
+    case "$val" in *[!A-Za-z0-9+/=]*) die "state file is corrupt (bad value for $key)" ;; esac
+    val="$(unb64 "$val")"
+    case "$key" in
+      backend) ST_backend="$val" ;;
+      handle)  ST_handle="$val"  ;;
+      socket)  ST_socket="$val"  ;;
+      tour)    ST_tour="$val"    ;;
+    esac
+  done < "$STATE"
+}
+
+# ---------------------------------------------------------------------------
+# Tour inspection — delegated to a real Lua file, invoked with `-l`.
+#
+# The path travels as argv and is never interpolated, and `-l` propagates the
+# script's exit status, so a failure to parse is a non-zero exit rather than a
+# silent pass.
+#
+# All three run FROM the workspace root, in a subshell, because a step's `file`
+# is relative to that root: asking whether a file still exists (and which line a
+# pattern names) from any other directory answers a different question than the
+# player will ask. The tour path is absolute precisely so this cd cannot move
+# it. `--` guards a root that starts with a dash; nothing here is interpolated.
+#
+# The invocation directory rides along as a third argv element so the report
+# can print paths that work from where the READER is standing, which is not
+# necessarily the root -- see `shown` in validate.lua. It is argv, like the
+# tour path, so it is data and never source.
+# ---------------------------------------------------------------------------
+#
+# The cd says what happened when it fails. A bare `|| exit 1` made a workspace
+# root that had been deleted (or turned unreadable) out from under a long
+# session look exactly like a tour that failed to validate: `open` printed
+# "tour is not playable (run: walkthrough validate ...)" and the reader went
+# off to fix a tour that was never wrong. Same directory, two entirely
+# different repairs, so the message has to distinguish them.
+lua_tour() { # $1 = mode, $2 = tour (absolute), $3 = workspace root
+  local here="$PWD"
+  ( cd -- "$3" 2>/dev/null \
+      || { echo "walkthrough: cannot enter the workspace root: $3" >&2; exit 1; }
+    nvim --headless --clean -l "$ROOT/lua/walkthrough/validate.lua" "$1" "$2" "$here" )
+}
+lua_validate() { lua_tour check "$1" "$2"; }  # strict: the CI rot gate
+lua_skips()    { lua_tour skips "$1" "$2"; }  # degrading: what `open` asks
+tour_files()   { lua_tour files "$1" "$2"; }
+
+# The README advertises `walkthrough validate .tours/*.tour` as the CI check,
+# so a glob that expands to several tours must validate every one of them.
+# Reading $1 only meant CI went green over rotted tours it had never looked at.
+# Every path is checked, one failure does not stop the rest, and the exit
+# status is non-zero if any of them failed.
+cmd_validate() {
+  local t abs ws rc=0
+  local -a failed=()
+  [ "$#" -gt 0 ] || die "no such tour: <none>"
+  # One root for the whole run: the tours are all being judged against the same
+  # workspace, and it is the caller's workspace, not each tour's directory.
+  ws="$(wt_workspace_root)"
+  for t in "$@"; do
+    if [ ! -f "$t" ]; then
+      echo "walkthrough: no such tour: $t" >&2
+      failed+=("$t"); rc=1; continue
+    fi
+    abs="$(wt_abspath "$t")" || { failed+=("$t"); rc=1; continue; }
+    lua_validate "$abs" "$ws" || { failed+=("$t"); rc=1; }
+  done
+  # With one argument the output is exactly what it always was: that tour's
+  # own verdict and nothing else. A summary only earns its line when there
+  # were several tours and the reader has to be told which ones failed.
+  #
+  # One path per line, not "${failed[*]}": that joins with a space, and a tour
+  # path may contain one. `a b.tour` and `a.tour b.tour` printed the same, so
+  # the line that exists to say WHICH tours failed could not be read back.
+  if [ "$#" -gt 1 ] && [ "${#failed[@]}" -gt 0 ]; then
+    echo "walkthrough: ${#failed[@]} of $# tours failed:" >&2
+    printf '  %s\n' "${failed[@]}" >&2
+  fi
+  exit "$rc"
+}
+cmd_schema()   { cat "$ROOT/schema.json"; }
+
+# `walkthrough list` with no argument means "the tours in this project", and
+# the project is the workspace root -- the same base every step's `file`
+# resolves against, so `list` now works from any directory in the tree, which
+# is the whole point of pinning the root. An explicit directory is left exactly
+# as the user typed it: that argument is a path they chose from where they are
+# standing, and second-guessing it would make `list ./x` mean something other
+# than `ls ./x`.
+cmd_list() {
+  local dir
+  if [ -n "${1:-}" ]; then dir="$1"; else dir="$(wt_workspace_root)/.tours"; fi
+  ls -1 -- "$dir"/*.tour 2>/dev/null || { echo "no tours in $dir/" >&2; exit 1; }
+}
+
+# The five values the player needs, handed over as base64 inside a vimscript
+# list and decoded in Lua. Keep this chunk free of single quotes: it lives
+# inside a vimscript single-quoted string.
+open_expr() { # $1 = absolute tour path, $2 = handle
+  printf "luaeval('%s', ['%s','%s','%s','%s','%s'])" \
+    '(function(a) local d = vim.base64.decode vim.opt.runtimepath:append(d(a[1])) vim.env.WALKTHROUGH_HANDLE = d(a[3]) vim.env.WALKTHROUGH_BACKEND = d(a[4]) vim.env.WALKTHROUGH_CLI = d(a[5]) require("walkthrough").open(d(a[2])) return 1 end)(_A)' \
+    "$(b64 "$ROOT")" "$(b64 "$1")" "$(b64 "$2")" "$(b64 "$BACKEND")" "$(b64 "$ROOT/bin/walkthrough")"
+}
+
+cmd_open() {
+  local tour tourabs wsroot sock handle f skips line
+  local -a files_arr=()
+  tour="${1:-}"; [ -f "$tour" ] || die "no such tour: $tour"
+  # Absolutise BEFORE anything runs from another directory, and settle the
+  # workspace root once: validation, the file list and the player must all
+  # resolve a step's `file` against the same base, or the CLI would approve a
+  # tour the player then cannot open.
+  tourabs="$(wt_abspath "$tour")" || exit 1
+  wsroot="$(wt_workspace_root)"
+  # `open` DEGRADES where `validate` REFUSES, and the difference is the point.
+  # `validate` is the CI rot gate: any unplayable step fails the tour. `open`
+  # is a person asking to be shown around, and the spec's error table is
+  # explicit about what they get -- "skips that hunk, renders the rest, reports
+  # which were dropped. Partial is better than nothing; silence is not." One
+  # pattern that drifted must not cost them the other five steps. This gate
+  # used to be the strict `check`, so it did exactly that.
+  #
+  # `skips` fails only when the document will not parse or when NO step is
+  # left to play, and has already said why on stderr. Everything it prints on
+  # stdout is a step being dropped, named here so the drop is never silent.
+  skips="$(lua_skips "$tourabs" "$wsroot")" \
+    || die "tour is not playable (run: walkthrough validate $tour)"
+  if [ -n "$skips" ]; then
+    echo "walkthrough: dropping unplayable step(s); the rest of the tour plays:" >&2
+    while IFS= read -r line; do echo "  $line" >&2; done <<< "$skips"
+  fi
+  load_backend
+
+  # NUL-separated so a source path containing a space (or a newline) arrives
+  # whole. The old `set -- $files` word-split BEFORE wt_nvim_cmd's `printf %q`
+  # ran, so it quoted the fragments rather than the path and opened bogus
+  # empty buffers instead of the file.
+  while IFS= read -r -d '' f; do
+    [ -n "$f" ] && files_arr+=("$f")
+  done < <(tour_files "$tourabs" "$wsroot")
+  # A process substitution throws its exit status away, so this is the only
+  # place the failure can be seen. `skips` above already refused a tour with
+  # nothing playable, and a playable step always names a readable file -- so an
+  # empty list here means tour_files did not run, not that the tour is empty.
+  # Saying so beats launching nvim with no files and calling that a
+  # walkthrough; tour_files has already printed the reason on stderr.
+  [ "${#files_arr[@]}" -gt 0 ] \
+    || die "no files to open for $tour (workspace root: $wsroot)"
+
+  sock="${TMPDIR:-/tmp}/walkthrough-$$.sock"; rm -f "$sock"
+  # The player is pinned to the same workspace root everything above resolved
+  # against — see wt_nvim_cmd.
+  handle="$(backend_open "$(wt_nvim_cmd "$wsroot" "$sock" ${files_arr[@]+"${files_arr[@]}"})")" \
+    || die "backend failed to open a surface"
+
+  # Readiness is the socket, never the shell prompt. 300 tries (~9s) matches
+  # the measured worst-case nvim startup time (Task 7); do not lower it.
+  wt_wait_for_socket "$sock" 300 \
+    || { backend_close "$handle"; die "nvim never came up on $sock (surface $handle)"; }
+
+  # WALKTHROUGH_CLI is the absolute path to this running CLI (derived from
+  # $ROOT, not $0, which may be relative). M.close() prefers it over a PATH
+  # lookup so teardown works even when bin/ was never put on PATH — putting
+  # it on PATH is documented as optional, so the plugin cannot depend on it.
+  nvim --server "$sock" --remote-expr "$(open_expr "$tourabs" "$handle")" >/dev/null \
+    || { backend_close "$handle"; die "failed to render the tour (surface $handle)"; }
+
+  # Absolute, so `reload` from any directory targets the tour that is actually
+  # playing rather than resolving the name against the wrong CWD.
+  state_write "$BACKEND" "$handle" "$sock" "$tourabs"
+  echo "$handle"; echo "$sock"
+}
+
+with_state() {
+  [ -f "$STATE" ] || die "no active walkthrough"
+  state_read
+  [ -n "$ST_socket" ] || die "state file names no socket"
+  nvim --server "$ST_socket" --remote-expr '1' >/dev/null 2>&1 \
+    || die "the walkthrough is gone (the user closed it)"
+}
+
+# Talk to the player, and let its refusals be OUR refusals.
+#
+# The player raises when it will not do what was asked -- stepping a walkthrough
+# that is not open, a reload whose new tour will not play. `--remote-expr`
+# reports that as a non-zero status and a multi-line `E5108` traceback through
+# nvim's own rpcrequest internals. The status was being thrown away (`reload`
+# ignored it entirely, so a failed reload looked exactly like a successful one),
+# and the traceback is noise the reader cannot act on. Keep the status, keep the
+# player's message, drop the traceback.
+remote_expr() { # $1 = expression to evaluate in the player
+  local err rc
+  err="$(nvim --server "$ST_socket" --remote-expr "$1" 2>&1 >/dev/null)"
+  rc=$?
+  [ "$rc" -eq 0 ] && return 0
+  err="${err%%$'\n'*}"
+  err="$(printf '%s\n' "$err" \
+    | sed -e 's/^Lua: Vim:E5108: Lua: //' -e 's/^\[string "luaeval()"\]:[0-9]*: //')"
+  [ -n "$err" ] || err="the walkthrough did not answer"
+  die "$err"
+}
+
+cmd_step() {
+  local n
+  n="${1:-+1}"
+  # This argument used to be interpolated raw into the remote expression, so
+  # `walkthrough step '<any vimscript>'` executed in the tour's nvim. Refusing
+  # anything that is not an optionally-signed integer is stronger than
+  # escaping: past this test the value is provably digits and a sign, so it
+  # cannot close a quote or introduce a token. (Base64 would be theatre for a
+  # number — and it would turn a typo into a confusing Lua error instead of
+  # the clear refusal below.)
+  #
+  # Checked BEFORE with_state, so a bad argument is refused on its own terms
+  # rather than hiding behind "no active walkthrough".
+  [[ "$n" =~ ^[+-]?[0-9]+$ ]] || die "step takes +N, -N or N (got: $n)"
+  with_state
+  case "$n" in
+    +*|-*) remote_expr "luaeval('require(\"walkthrough\").step(_A)', ${n#+})" ;;
+    *)     remote_expr "luaeval('require(\"walkthrough\").goto_step(_A)', $n)" ;;
+  esac
+}
+
+cmd_reload() {
+  local t
+  with_state
+  t="$(wt_abspath "${1:-$ST_tour}")" || exit 1
+  remote_expr "$(printf "luaeval('%s', '%s')" \
+    '(function(a) require("walkthrough").reload(vim.base64.decode(a)) return 1 end)(_A)' \
+    "$(b64 "$t")")"
+}
+
+cmd_close() {
+  [ -f "$STATE" ] || return 0
+  state_read
+  # Use the backend RECORDED when the tour was opened, not whatever the
+  # current terminal happens to detect. Re-detecting meant that closing from
+  # any other terminal died with "no backend for 'none'" — naming a backend
+  # the state file directly contradicts — and left both the tab and the stale
+  # state file behind. The _close_surface arm below already worked this way.
+  WALKTHROUGH_BACKEND="$ST_backend"
+  load_backend
+  backend_close "$ST_handle"
+  rm -f "$STATE" "$ST_socket"
+}
+
+usage() {
+  cat <<'EOF'
+walkthrough — play guided code tours in nvim
+
+  walkthrough open <tour.tour>     open a tour (prints handle and socket)
+  walkthrough step <+1|-1|N>       move along the narrative
+  walkthrough reload [tour.tour]   re-render after files changed on disk
+  walkthrough close                end the walkthrough
+  walkthrough list [dir]           list tours (default: <workspace root>/.tours/)
+  walkthrough validate <tour>...   exit 0 only if every tour is playable,
+                                   reporting the line each pattern resolved to
+  walkthrough schema               print the JSON schema
+
+A step's file paths are relative to the workspace root: the git root of the
+directory you run this from, or that directory itself when it is not a
+repository. Where the .tour file lives makes no difference. `list` with no
+argument looks in that root's .tours/; an explicit dir is taken as typed.
+
+`validate` is strict — one step it cannot play fails the tour, which is what
+makes it a CI rot gate. `open` is not: it drops the steps it cannot play,
+says which, and plays the rest. It refuses only a tour with nothing left.
+
+cmux is the only terminal backend in v0.1. It is detected automatically, and
+any other terminal is refused by name rather than half-worked around — you
+cannot tell "unsupported" from "broken" once something half-works. Adding a
+backend is one file, backends/<name>.sh, defining backend_open and
+backend_close; set WALKTHROUGH_BACKEND=<name> to choose one yourself.
+EOF
+}
+
+case "${1:-}" in
+  open) shift; cmd_open "$@" ;;
+  step) shift; cmd_step "$@" ;;
+  reload) shift; cmd_reload "$@" ;;
+  close) shift; cmd_close "$@" ;;
+  list) shift; cmd_list "$@" ;;
+  validate) shift; cmd_validate "$@" ;;
+  schema) cmd_schema ;;
+  _close_surface) shift; WALKTHROUGH_BACKEND="${1:-}"; load_backend; backend_close "${2:-}" ;;
+  -h|--help|help|"") usage ;;
+  *) die "unknown command: $1 (try --help)" ;;
+esac
