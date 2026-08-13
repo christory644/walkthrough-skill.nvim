@@ -1,0 +1,72 @@
+name: test
+on:
+  push:
+  pull_request:
+  # The fuller fuzz tier (below) is too slow to run on every push and too
+  # valuable to run never.
+  schedule:
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+
+jobs:
+  lua:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        nvim: ['v0.10.4', 'v0.11.3', 'stable']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rhysd/action-setup-vim@v1
+        with:
+          neovim: true
+          version: ${{ matrix.nvim }}
+      # Includes tests/test_fuzz.lua, whose fast tier drives ~590 malformed
+      # documents through open/goto/step/BufEnter/:cc/reload/close in process
+      # (~8s). It is in the per-push suite deliberately: the defect class it
+      # covers came back FIVE times, and twice a fuzz that was not run per push
+      # said the tree was clean when it was not.
+      - name: headless suite
+        run: ./tests/run.sh
+
+  shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rhysd/action-setup-vim@v1
+        with: { neovim: true, version: stable }
+      - name: shellcheck
+        run: shellcheck bin/walkthrough backends/*.sh install.sh tests/*.sh
+      - name: backend detection
+        run: ./tests/test_backend_detect.sh
+      - name: cli
+        run: ./tests/test_cli.sh
+      # The skill bundle and the installer. install.sh is the first command
+      # every user runs; this suite exercises it against a scratch HOME of its
+      # own making, never the runner's.
+      - name: skill bundle and installer
+        run: ./tests/test_skill_bundle.sh
+      # cmux is not available on a runner, so this takes its SKIP path. It runs
+      # anyway: the guard that makes it skip is the thing that keeps the suite
+      # from opening a terminal surface on a machine that has no terminal, and a
+      # guard nothing ever executes is a guard nobody notices breaking.
+      - name: cmux backend (skips outside cmux)
+        run: ./tests/test_backend_cmux.sh
+
+  # The fuller fuzz: all three positions of the field x value matrix (~1700
+  # documents), and every tenth document ALSO validated out of process by a real
+  # `nvim -l validate.lua`, which is what proves the fast tier's in-process
+  # verdict is the real gate's verdict rather than a convenient copy of it.
+  # ~50s. Nightly and on demand, not per push.
+  fuzz:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rhysd/action-setup-vim@v1
+        with: { neovim: true, version: stable }
+      - name: full fuzz, with the real out-of-process gate sampled
+        env:
+          WALKTHROUGH_FUZZ: full
+          WALKTHROUGH_FUZZ_OOP: '10'
+        run: nvim --headless --clean -l tests/test_fuzz.lua
