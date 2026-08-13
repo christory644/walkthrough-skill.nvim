@@ -1,0 +1,42 @@
+{
+  "title": "How walkthrough-skill.nvim is put together",
+  "description": "A tour of the tour player, written by hand.",
+  "steps": [
+    {
+      "title": "the format",
+      "file": "lua/walkthrough/tour.lua",
+      "pattern": "^function M.validate",
+      "description": "Everything starts with a CodeTour document. We validate shape only - whether a file exists is a question about the world at render time, not about the document."
+    },
+    {
+      "title": "locating a step",
+      "file": "lua/walkthrough/tour.lua",
+      "pattern": "^function M.resolve",
+      "description": "A step says where it lives with either a line number or a pattern. Patterns re-locate themselves after edits, which is why tours committed to a repo do not rot as fast as you would expect."
+    },
+    {
+      "title": "narration",
+      "file": "lua/walkthrough/render.lua",
+      "pattern": "virt_lines_above",
+      "description": "Notes render ABOVE the code, never at end-of-line. End-of-line virtual text is truncated by window width, and narration is sentences."
+    },
+    {
+      "title": "the narrative is a quickfix list",
+      "file": "lua/walkthrough/nav.lua",
+      "pattern": "^function M.populate",
+      "description": "vim already has a structure for an ordered set of locations across files. Using it means :cnext, :copen and every quickfix plugin work on tours for free."
+    },
+    {
+      "title": "terminals are pluggable",
+      "file": "backends/common.sh",
+      "pattern": "wt_detect_backend",
+      "description": "Nothing above this line knows which terminal it is in. Adding a backend is one file with two functions."
+    },
+    {
+      "title": "validating from outside nvim",
+      "file": "lua/walkthrough/validate.lua",
+      "pattern": "local t = tour_mod\\.load(path)",
+      "description": "The CLI does not re-implement validation - it calls into the same M.load a running player uses, then adds the checks that only make sense from outside a buffer: does every referenced file still exist, does every pattern still match, is every line still a line in its file. This is what CI runs before a tour ships."
+    }
+  ]
+}
