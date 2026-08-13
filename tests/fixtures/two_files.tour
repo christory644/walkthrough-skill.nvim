@@ -1,0 +1,26 @@
+{
+  "title": "Two-file tour",
+  "description": "Fixture: narrative order is not file order.",
+  "steps": [
+    {
+      "title": "first",
+      "file": "tests/fixtures/alpha.txt",
+      "line": 2,
+      "description": "First note.\nSecond line of the first note.",
+      "selection": { "start": { "line": 2, "character": 1 },
+                     "end":   { "line": 3, "character": 1 } }
+    },
+    {
+      "title": "other file",
+      "file": "tests/fixtures/beta.txt",
+      "line": 1,
+      "description": "Note in the other file."
+    },
+    {
+      "title": "back again",
+      "file": "tests/fixtures/alpha.txt",
+      "pattern": "^five$",
+      "description": "Located by pattern, not line number."
+    }
+  ]
+}
