@@ -1,0 +1,392 @@
+#!/usr/bin/env bash
+#
+# with-lock <name> <command> [args...]
+#
+# Run <command> while holding the named lock; release it however the command
+# ends, including on an interrupt; exit with the command's own status.
+#
+# Why this exists. Several agent sessions work this repository at once, in
+# separate git worktrees. Everything they contend over can be namespaced away
+# — XDG_RUNTIME_DIR for the CLI state file, a scratch HOME for installer
+# tests, PID-scoped process cleanup instead of pkill — except one thing: cmux
+# focus. Focus is a single global property of the user's terminal, and
+# tests/test_backend_cmux.sh asserts that opening a surface MOVES focus to it
+# and closing one RETURNS focus to the caller. A second session opening or
+# closing a surface inside that window does not make the test noisily flaky;
+# it makes it report a verdict that is not about the code under test. This
+# project has twice been burned by a measurement that could not tell success
+# from failure, so the one resource that cannot be namespaced gets a mutex.
+# See docs/parallel-work.md.
+#
+# Environment:
+#   LOCK_OWNER     who to record as the holder (default $USER@$HOSTNAME:$$)
+#   LOCK_DIR       directory holding lock directories (default: see below)
+#   LOCK_TIMEOUT   seconds to wait before giving up      (default 300)
+#   LOCK_MAX_AGE   seconds after which a lease is stale  (default 1800)
+#   LOCK_POLL      seconds between acquire attempts      (default 0.25)
+#
+# Exit status: the command's, unchanged. Except when the command never ran:
+#   2  — usage or configuration error
+#   75 — timed out waiting (EX_TEMPFAIL; 75 rather than 1 so a caller can tell
+#        "never got the lock" from "the wrapped command failed")
+#
+# `set -e` is deliberately NOT set: this wraps test runs, and an -e that ended
+# the script on the wrapped command's failure would swallow the very status
+# this exists to pass through.
+set -uo pipefail
+
+EX_USAGE=2
+EX_TIMEOUT=75
+
+usage() {
+  cat >&2 <<'EOF'
+usage: scripts/with-lock <name> <command> [args...]
+
+Runs <command> under the named lock and exits with its status.
+
+  LOCK_OWNER=<who>       recorded as the holder (default $USER@$HOSTNAME:$$)
+  LOCK_TIMEOUT=<secs>    give up waiting after this long (default 300)
+  LOCK_MAX_AGE=<secs>    lease older than this is stale (default 1800)
+  LOCK_POLL=<secs>       interval between attempts (default 0.25)
+  LOCK_DIR=<path>        where locks live (default: the repo's common git dir)
+
+  scripts/with-lock cmux ./tests/test_backend_cmux.sh
+EOF
+}
+
+die() { echo "with-lock: $*" >&2; exit "$EX_USAGE"; }
+
+[ "$#" -ge 2 ] || { usage; exit "$EX_USAGE"; }
+
+NAME="$1"; shift
+# A lock name becomes a path component. Anything with a slash or a `..` in it
+# could name a directory outside the lock root — and this script deletes the
+# directories it decides are stale.
+case "$NAME" in
+  *[!A-Za-z0-9._-]*|''|*..*) die "invalid lock name: '$NAME' (use [A-Za-z0-9._-], no '..')" ;;
+esac
+
+# ---------------------------------------------------------------------------
+# Where locks live
+#
+# The default is <common git dir>/walkthrough-locks — `git rev-parse
+# --git-common-dir` resolves to the SAME absolute path from the main checkout
+# and from every linked worktree, which is exactly the property needed: the
+# sessions this guards against are working in separate worktrees, so a lock
+# stored inside one worktree is invisible to the others and guards nothing.
+# It is also per-clone (two unrelated checkouts do not block each other),
+# never tracked by git, and immune to sessions that happen to run with
+# different TMPDIRs — which a fixed $TMPDIR path is not, since a sandboxed or
+# launchd-spawned process routinely gets a private one.
+#
+# Outside a git repository there is no such anchor, so fall back to a fixed
+# per-user path under $TMPDIR.
+# ---------------------------------------------------------------------------
+lock_root() {
+  local common
+  if [ -n "${LOCK_DIR:-}" ]; then printf '%s' "$LOCK_DIR"; return 0; fi
+  if common="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" \
+     && [ -n "$common" ]; then
+    printf '%s/walkthrough-locks' "$common"; return 0
+  fi
+  # git older than 2.31 has no --path-format; its --git-common-dir may be
+  # relative to the current directory.
+  if common="$(git rev-parse --git-common-dir 2>/dev/null)" && [ -n "$common" ]; then
+    case "$common" in /*) ;; *) common="$PWD/$common" ;; esac
+    printf '%s/walkthrough-locks' "$common"; return 0
+  fi
+  printf '%s/walkthrough-locks-%s' "${TMPDIR:-/tmp}" "${USER:-x}"
+}
+
+ROOT="$(lock_root)"
+ROOT="${ROOT%/}"
+LOCK="$ROOT/$NAME.lock"
+mkdir -p "$ROOT" 2>/dev/null || die "cannot create lock directory: $ROOT"
+
+HOST="${HOSTNAME:-$(hostname 2>/dev/null || echo unknown)}"
+# Newlines would corrupt the one-key-per-line metadata below, and the holder
+# identifier comes from the environment.
+OWNER="$(printf '%s' "${LOCK_OWNER:-${USER:-unknown}@$HOST:$$}" | tr -d '\n\r')"
+TIMEOUT="${LOCK_TIMEOUT:-300}"
+MAX_AGE="${LOCK_MAX_AGE:-1800}"
+POLL="${LOCK_POLL:-0.25}"
+# A lock directory whose metadata never appeared is judged by its own mtime
+# once this many seconds have passed — see stale_reason.
+INFO_GRACE="${LOCK_INFO_GRACE:-10}"
+
+case "$TIMEOUT" in ''|*[!0-9]*) die "LOCK_TIMEOUT must be whole seconds, got '$TIMEOUT'" ;; esac
+case "$MAX_AGE" in ''|*[!0-9]*) die "LOCK_MAX_AGE must be whole seconds, got '$MAX_AGE'" ;; esac
+case "$INFO_GRACE" in ''|*[!0-9]*) die "LOCK_INFO_GRACE must be whole seconds, got '$INFO_GRACE'" ;; esac
+
+# Identifies THIS holder's tenure, so release can tell "the lock I took" from
+# "a lock someone else took after mine was broken as stale".
+TOKEN="$$-$(date -u +%s)-${RANDOM}${RANDOM}"
+
+HELD=0
+CHILD=""
+STEALS=0
+ANNOUNCED=0
+
+# ---------------------------------------------------------------------------
+# The holder's card
+# ---------------------------------------------------------------------------
+# Both files are written to a temporary name and renamed into place. rename(2)
+# is atomic within a directory, so a waiter reading the lock either sees the
+# whole card or none of it — writing in place let waiters read a HALF-written
+# card and report "held by w5 since unknown", which is the same lie as an
+# anonymous lock.
+info_write() {
+  # token first: release compares it, and a lock we hold but cannot prove we
+  # hold would leak. `command` loses its newlines for the same reason OWNER
+  # does — one key per line is the whole format.
+  printf '%s\n' "$TOKEN" > "$LOCK/token.tmp" || return 1
+  mv "$LOCK/token.tmp" "$LOCK/token" || return 1
+  {
+    printf 'owner=%s\n' "$OWNER"
+    printf 'pid=%s\n' "$$"
+    printf 'host=%s\n' "$HOST"
+    printf 'epoch=%s\n' "$(date -u +%s)"
+    printf 'acquired=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf 'command=%s\n' "$(printf '%s' "$*" | tr -d '\n\r')"
+  } > "$LOCK/info.tmp" || return 1
+  mv "$LOCK/info.tmp" "$LOCK/info"
+}
+
+H_owner=""; H_pid=""; H_host=""; H_epoch=""; H_acquired=""; H_command=""
+info_read() {
+  local line k v
+  H_owner=""; H_pid=""; H_host=""; H_epoch=""; H_acquired=""; H_command=""
+  [ -f "$LOCK/info" ] || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    k="${line%%=*}"; v="${line#*=}"
+    case "$k" in
+      owner)    H_owner="$v" ;;
+      pid)      H_pid="$v" ;;
+      host)     H_host="$v" ;;
+      epoch)    H_epoch="$v" ;;
+      acquired) H_acquired="$v" ;;
+      command)  H_command="$v" ;;
+    esac
+  done < "$LOCK/info"
+  return 0
+}
+
+# A lock that blocks you anonymously is worse than no lock: every message that
+# makes a caller wait or fail says who, since when, and what they are running.
+holder_desc() {
+  printf '%s (pid %s on %s) since %s running: %s' \
+    "${H_owner:-unknown}" "${H_pid:-?}" "${H_host:-?}" \
+    "${H_acquired:-unknown}" "${H_command:-?}"
+}
+
+now_epoch() { date -u +%s; }
+
+# BSD stat and GNU stat spell mtime differently, and GNU's `-f` means
+# something else entirely — so try one, and accept the answer only if it is a
+# number.
+#
+# Prints NOTHING when the answer is unknown — including when the path vanished
+# mid-check, which happens constantly under contention. It used to print 0,
+# and 0 is a timestamp: every caller then computed an age of fifty-five years
+# and broke a lock that a live process was holding. Unknown must stay unknown.
+mtime_of() {
+  local m
+  m="$(stat -f %m "$1" 2>/dev/null)"
+  case "$m" in ''|*[!0-9]*) m="$(stat -c %Y "$1" 2>/dev/null)" ;; esac
+  case "$m" in ''|*[!0-9]*) m='' ;; esac
+  printf '%s' "$m"
+}
+
+# What tenure the lock is under right now. A tenure's token is unique to it, so
+# two reads that agree mean the lock did not change hands in between — which is
+# how a break decision is kept from landing on a lease taken after it was made.
+lease_id() {
+  printf '%s|%s|%s' \
+    "$(cat "$LOCK/token" 2>/dev/null)" "$(mtime_of "$LOCK")" "$(mtime_of "$LOCK/info")"
+}
+
+# ---------------------------------------------------------------------------
+# Staleness
+#
+# Two rules, and both are needed. A dead PID is the common case — a session
+# killed mid-run must not wedge the repository for everyone else. Age is the
+# backstop for the cases the PID check cannot decide: a holder on another
+# machine (whose PIDs mean nothing here) and a PID that has since been reused
+# by an unrelated process, which would otherwise look alive forever.
+#
+# Prints the reason and returns 0 when the lease should be broken.
+# ---------------------------------------------------------------------------
+stale_reason() {
+  local age now mt
+  now="$(now_epoch)"
+  if ! info_read; then
+    # No metadata: either an acquire caught in the microseconds between mkdir
+    # and the write, or the wreckage of one that died in between. The grace
+    # period tells those apart without a guess — and if the directory's age
+    # cannot be read at all (it vanished while we looked, say) the answer is
+    # "not stale". Every unknown here fails closed: waiting a little longer for
+    # a lock that was free costs seconds, and breaking a lock that was held
+    # costs the thing the lock was protecting.
+    mt="$(mtime_of "$LOCK")"
+    [ -n "$mt" ] || return 1
+    age=$(( now - mt ))
+    if [ "$age" -ge "$INFO_GRACE" ]; then
+      printf 'it has no holder metadata and the directory is %ss old' "$age"
+      return 0
+    fi
+    return 1
+  fi
+  case "$H_pid" in
+    ''|*[!0-9]*) ;;
+    *)
+      # PIDs are only meaningful on the machine that issued them.
+      if [ "$H_host" = "$HOST" ] && ! kill -0 "$H_pid" 2>/dev/null; then
+        printf 'its holder (pid %s on %s) is gone' "$H_pid" "$H_host"
+        return 0
+      fi
+      ;;
+  esac
+  case "$H_epoch" in
+    ''|*[!0-9]*) ;;
+    *)
+      age=$(( now - H_epoch ))
+      if [ "$age" -ge "$MAX_AGE" ]; then
+        printf 'the lease is %ss old, past the %ss maximum' "$age" "$MAX_AGE"
+        return 0
+      fi
+      ;;
+  esac
+  return 1
+}
+
+# Break loudly, and break by RENAME. `mv` of the directory succeeds for
+# exactly one of several waiters that decided simultaneously — the losers find
+# nothing to move, so the lock is never deleted twice, and only the session
+# that actually broke it says so.
+break_stale() { # reason lease-id-that-was-judged
+  local reason="$1" judged="$2" grave="$LOCK.stale.$$.$RANDOM"
+  info_read || true
+  if mv "$LOCK" "$grave" 2>/dev/null; then
+    # The lease can change hands between the judgement and the rename. Check
+    # what was actually moved: if it is not the tenure that was judged, this
+    # just took a live lock away from its holder, so put it straight back and
+    # break nothing.
+    if [ "$(cat "$grave/token" 2>/dev/null)" != "${judged%%|*}" ]; then
+      if [ ! -e "$LOCK" ] && mv "$grave" "$LOCK" 2>/dev/null; then
+        return 0
+      fi
+      echo "with-lock: a lease under '$NAME' changed hands mid-break and could not be" >&2
+      echo "  restored; its holder will find the lock gone. lock: $LOCK" >&2
+      rm -rf "$grave"
+      return 0
+    fi
+    {
+      echo "with-lock: BROKE STALE LOCK '$NAME' — $reason"
+      echo "  it was held by $(holder_desc)"
+      echo "  lock: $LOCK"
+    } >&2
+    rm -rf "$grave"
+  fi
+  STEALS=$(( STEALS + 1 ))
+  if [ "$STEALS" -gt 5 ]; then
+    die "gave up after $STEALS attempts to break the stale lock at $LOCK"
+  fi
+}
+
+acquire() {
+  local start="$SECONDS" waited reason judged
+  while :; do
+    # mkdir, because it is atomic on POSIX: the directory either got created
+    # by us or it did not. A `[ -e ]` test followed by a create is two
+    # operations with a window between them, and under real contention that
+    # window is where both sessions decide they hold the lock.
+    if mkdir "$LOCK" 2>/dev/null; then
+      HELD=1
+      info_write "$@" || die "acquired $LOCK but could not record the holder"
+      return 0
+    fi
+    if reason="$(stale_reason)"; then
+      # Confirm before breaking. A lock handed from one holder to the next
+      # between these two looks is a WORKING lock, not a stale one, and under
+      # contention that handover happens every few milliseconds — so require
+      # the same tenure to still be there, and still be stale, a poll later.
+      judged="$(lease_id)"
+      sleep "$POLL"
+      if [ "$(lease_id)" = "$judged" ] && stale_reason >/dev/null; then
+        break_stale "$reason" "$judged"
+      fi
+      # Falls through to the timeout check rather than looping straight back:
+      # a lock that keeps looking stale and never confirms must still be able
+      # to give up, or "never wait forever" quietly stops being true.
+    else
+      if [ "$ANNOUNCED" -eq 0 ]; then
+        info_read || true
+        echo "with-lock: waiting for '$NAME' — held by $(holder_desc)" >&2
+        ANNOUNCED=1
+      fi
+      sleep "$POLL"
+    fi
+    waited=$(( SECONDS - start ))
+    if [ "$waited" -ge "$TIMEOUT" ]; then
+      info_read || true
+      {
+        echo "with-lock: timed out after ${waited}s waiting for lock '$NAME'"
+        echo "  held by $(holder_desc)"
+        echo "  lock: $LOCK"
+        echo "  raise LOCK_TIMEOUT (seconds) to wait longer."
+      } >&2
+      exit "$EX_TIMEOUT"
+    fi
+  done
+}
+
+# Idempotent, and never removes a lock that is no longer ours: if this tenure
+# was broken as stale while the command ran, the directory now belongs to
+# someone else and deleting it would hand a third session a lock two of them
+# believe they hold.
+release() {
+  [ "$HELD" -eq 1 ] || return 0
+  HELD=0
+  if [ "$(cat "$LOCK/token" 2>/dev/null)" = "$TOKEN" ]; then
+    rm -rf "$LOCK"
+  fi
+}
+
+# A crashed or interrupted holder must not wedge the repository. The wrapped
+# command is killed first: leaving it running while the lock is released is
+# precisely the state the lock exists to prevent.
+#
+# shellcheck disable=SC2329
+# ^ "This function is never invoked": it is, from the two trap handlers below,
+# which shellcheck stops tracing once the script ends in `exit "$status"` (the
+# status passthrough, which is not negotiable). Invoked indirectly is the case
+# SC2329's own documentation says to silence.
+on_signal() { # signal-name signal-number
+  [ -n "$CHILD" ] && kill -"$1" "$CHILD" 2>/dev/null
+  release
+  trap - EXIT
+  exit $(( 128 + $2 ))
+}
+
+trap release EXIT
+trap 'on_signal INT 2' INT
+trap 'on_signal TERM 15' TERM
+
+acquire "$@"
+
+# Backgrounded and waited on, not run in the foreground, because bash defers a
+# trap until the running foreground command finishes: a SIGTERM arriving
+# during a ten-minute test run would not release the lock until that run ended
+# — which is exactly when releasing matters. `wait` is interruptible, so the
+# trap fires immediately.
+#
+# `<&0` is not redundant: without an explicit redirection bash gives an
+# asynchronous command /dev/null for stdin, and this wraps arbitrary commands.
+"$@" <&0 &
+CHILD=$!
+wait "$CHILD"
+status=$?
+CHILD=""
+release
+trap - EXIT
+exit "$status"

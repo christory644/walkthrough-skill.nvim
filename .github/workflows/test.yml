@@ -36,7 +36,7 @@ jobs:
       - uses: rhysd/action-setup-vim@v1
         with: { neovim: true, version: stable }
       - name: shellcheck
-        run: shellcheck bin/walkthrough backends/*.sh install.sh tests/*.sh
+        run: shellcheck bin/walkthrough backends/*.sh install.sh tests/*.sh scripts/with-lock
       - name: backend detection
         run: ./tests/test_backend_detect.sh
       - name: cli
@@ -46,6 +46,14 @@ jobs:
       # own making, never the runner's.
       - name: skill bundle and installer
         run: ./tests/test_skill_bundle.sh
+      # scripts/with-lock, the mutex that keeps parallel sessions out of each
+      # other's cmux focus assertions (docs/parallel-work.md). Real concurrency:
+      # 12 processes contending over one lock, plus the same run with the atomic
+      # acquire neutered, which MUST come out interleaved — a contention test
+      # that passes without the lock is measuring nothing. No cmux surface is
+      # opened and no real $HOME is touched; it is sleeps and files throughout.
+      - name: with-lock, under contention
+        run: ./tests/test_with_lock.sh
       # cmux is not available on a runner, so this takes its SKIP path. It runs
       # anyway: the guard that makes it skip is the thing that keeps the suite
       # from opening a terminal surface on a machine that has no terminal, and a
