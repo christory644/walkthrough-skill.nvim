@@ -180,6 +180,33 @@ end
 T.eq(sel_shapes.steps[5].range, { 1, 2 }, "...while a usable selection is still honoured")
 T.eq(sel_shapes.steps[5].range_note, nil, "...with nothing to note")
 
+-- ...and a selection that is not there at all is not a malformed one (#4).
+--
+-- `null` is JSON for "no value", and `vim.json.decode` renders it as `vim.NIL`
+-- -- a userdata sentinel, which is not `nil`. So `s.selection ~= nil` said yes
+-- about a field the document had explicitly declined to give, and `validate`
+-- reported a highlight falling back for a selection nobody wrote. The note is
+-- how `validate` tells an author their selection could not be read; printed
+-- for an absent one it sends them looking for a mistake they did not make.
+--
+-- Decoded from real JSON, not written as a Lua table: `vim.NIL` is what the
+-- decoder produces and a hand-built table cannot honestly stand in for it.
+local decoded = vim.json.decode([[
+  { "title": "x", "steps": [
+    { "description": "d", "file": "tests/fixtures/alpha.txt", "line": 3, "selection": null },
+    { "description": "d", "file": "tests/fixtures/alpha.txt", "line": 4 } ] }
+]])
+-- The premise, stated: if the decoder ever started returning a plain `nil`
+-- here, every assertion below would pass while measuring nothing.
+T.ok(decoded.steps[1].selection == vim.NIL, "JSON null decodes to vim.NIL, not nil")
+local null_sel = tour.validate(decoded)
+T.eq(null_sel.steps[1].range_note, nil,
+  "a selection that is explicitly null is absent, not malformed: nothing to note")
+T.eq(null_sel.steps[1].range, { 3, 3 }, "...and the step highlights its own line")
+T.eq(null_sel.steps[1].range_note, null_sel.steps[2].range_note,
+  "...exactly as a step that never mentioned 'selection' does")
+T.ok(null_sel.steps[1].playable, "...and it still plays, as it always did")
+
 -- A document may NAME a field we do not know; it may not WRITE one we compute.
 -- `range` and `range_note` are derived from `selection`, and unknown fields are
 -- preserved -- so a document carrying its own `range` used to have it survive

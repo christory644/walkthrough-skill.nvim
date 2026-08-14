@@ -166,7 +166,14 @@ function M.validate(t)
     if from ~= nil and to ~= nil and not M.line_problem(from) and not M.line_problem(to) then
       s.range = { from, to }
     else
-      if s.selection ~= nil then
+      -- `~= nil` is not "the author wrote something here". `vim.json.decode`
+      -- renders JSON `null` as `vim.NIL`, a userdata sentinel that is not
+      -- `nil` -- so `"selection": null`, which is the document saying it has
+      -- no selection, used to be reported as a selection we could not read.
+      -- The note exists to tell an author their selection did not survive;
+      -- printed for one they never wrote, it sends them hunting a mistake
+      -- that is not there. An absent field is absent however it is spelled.
+      if s.selection ~= nil and s.selection ~= vim.NIL then
         s.range_note = "'selection' is not a usable line range; highlighting the step's own line instead"
       end
       if type(s.line) == "number" and not M.line_problem(s.line) then

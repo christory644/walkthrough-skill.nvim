@@ -678,6 +678,33 @@ check "OD5c the reader is parked on the step's own line" "1:alpha" \
   "$(od_player 'line(".") . ":" . getline(".")')"
 od_end
 
+# 5d. ...and a selection that is not there at all is not a malformed one.
+#
+# `null` is JSON for "no value", and `vim.json.decode` renders it as `vim.NIL`
+# — userdata, which is not `nil`. So the `s.selection ~= nil` test that guards
+# the note above said yes about a field the document had explicitly declined
+# to give, and `validate` reported a highlight falling back for a selection
+# nobody wrote. Harmless to the step, and exactly the kind of report that
+# teaches an author to stop reading them: it names a field they did not get
+# wrong. Run through the CLI because that is where an author meets it — the
+# note is printed by the real out-of-process `validate`, not in Lua.
+printf '%s\n' '{ "title": "an absent selection", "steps": [
+  { "title": "s1", "file": "src/app.txt", "line": 1, "description": "d",
+    "selection": null },
+  { "title": "s2", "file": "src/app.txt", "line": 2, "description": "d" } ] }' > "$WORK/od/nullsel.tour"
+nullselout="$( cd "$WORK/od" && "$WT" validate nullsel.tour 2>&1 )"
+check "OD5d validate passes a tour whose selection is null" "0" "$?"
+printf %s "$nullselout" | grep -q 'selection'
+check "OD5d ...and says nothing about a selection that was never there" "1" "$?"
+check "OD5d ...leaving no report at all, as for a step with no selection" "" "$nullselout"
+od_open nullsel.tour
+check "OD5d open plays it" "0" "$od_rc"
+grep -q 'dropping unplayable step(s)' "$od_err"
+check "OD5d ...dropping nothing" "1" "$?"
+check "OD5d the reader is parked on the step's own line" "1:alpha" \
+  "$(od_player 'line(".") . ":" . getline(".")')"
+od_end
+
 # 5. a field that is the wrong SHAPE. schema.json declares `title` a string;
 # nothing enforced the schema, so a title that is an object reached string
 # concatenation inside the render pass, threw through the BufEnter autocmd and

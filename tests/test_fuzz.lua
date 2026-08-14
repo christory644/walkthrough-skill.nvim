@@ -511,6 +511,34 @@ do
 end
 for _, s in ipairs(SHAPES) do case("doc:" .. s[1], s[2]) end
 
+-- A field the document explicitly gives NO value must be indistinguishable
+-- from one it never mentions -- for `selection`, which is decoration, and where
+-- "we could not read your selection" is the only thing we would otherwise have
+-- to say about it.
+--
+-- The corpus above already feeds `null` into every field, and it caught nothing
+-- here: `null` decodes to `vim.NIL`, a userdata sentinel that is not `nil`, so
+-- the step still played, `validate` still exited 0, and every rule this file
+-- has was satisfied. What the note cost was a READER -- `validate` reported a
+-- highlight falling back for a selection they had not written (#4) -- and no
+-- assertion about one document alone can see that. Two documents can: build a
+-- pair that differ ONLY in `"selection": null`, and require the same verdict
+-- AND the same words.
+--
+-- Only `selection` is asserted this way, deliberately. `title`, `file`, `line`
+-- and `pattern` are judged rather than decorative, and a `null` in one of them
+-- is a value of a type we cannot use -- reported as such, and costing the step.
+-- That is a different question from this one, and it is answered above.
+do
+  local rc_without, report_without = validate_check(put(document(nil, nil, 0)))
+  local rc_with, report_with = validate_check(put(document("selection", "null", 1)))
+  T.eq(rc_without, 0, "the base document validates, so this pair measures something")
+  T.eq(rc_with, rc_without,
+    "'selection': null reaches the same verdict as no selection at all")
+  T.eq(report_with, report_without,
+    "...and is reported in exactly the same words, having said nothing extra")
+end
+
 -- A tour path that does not exist at all: `open` must refuse it the way
 -- `validate` does, not with a traceback.
 do
@@ -536,6 +564,16 @@ local TABLES = {
   { "hash_steps", { title = "t", steps = { a = 1 } } },
   { "nan_selection", { title = "t", steps = { { file = FILE_A, line = 1, description = "d",
     selection = { start = { line = nan }, ["end"] = { line = nan } } } } } },
+  -- `vim.NIL` on the entry point that does NOT go through the decoder. A caller
+  -- who decodes a tour themselves and hands us the table -- which `reload` and
+  -- the Lua API both invite -- carries the sentinel in with them, so it reaches
+  -- every field here without a JSON document in sight.
+  { "vimnil_selection", { title = "t", steps = { { file = FILE_A, line = 1,
+    description = "d", selection = vim.NIL } } } },
+  { "vimnil_title", { title = "t", steps = { { file = FILE_A, line = 1,
+    description = "d", title = vim.NIL } } } },
+  { "vimnil_line", { title = "t", steps = { { file = FILE_A, pattern = "^alpha2$",
+    description = "d", line = vim.NIL } } } },
 }
 for _, tc in ipairs(TABLES) do
   local r = quiet(function()
