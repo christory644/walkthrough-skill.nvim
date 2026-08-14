@@ -28,10 +28,19 @@ it simply stopped being what the docs lead with.
 workflow began at `git diff` and stopped if nothing had changed — the one line
 that made an agent refuse "walk me through the auth module".
 
-**Only the cmux backend ships.** The plan lists cmux / tmux / plain window as
-auto-detected; detection still names tmux, but no `backends/tmux.sh` exists and
-`usage()` no longer advertises one. An unsupported terminal is refused by name
-instead of half-worked around.
+**Both cmux and tmux ship.** The plan lists cmux / tmux / plain window as
+auto-detected and says only cmux would be implemented in v0.1; `backends/tmux.sh`
+now exists and is covered by `tests/test_backend_tmux.sh`, which self-hosts a
+private `tmux -L` server so CI exercises real focus and teardown rather than a
+skip guard. There is still no plain-window backend: a terminal that is neither
+is detected and refused by name.
+
+The two teardowns are not the same mechanism, which is why the seam was worth
+having. cmux selects the tab to the *right* of a closed one, so the walkthrough
+tab is positioned immediately left of the caller and quitting returns you where
+you started. tmux selects the *most recently used* window, so position is
+cosmetic there and teardown follows the reader instead — measured, not assumed,
+and asserted so a future "fix" that reintroduces positioning breaks a test.
 
 ## Semantics
 

@@ -488,9 +488,10 @@ argument looks in that root's .tours/; an explicit dir is taken as typed.
 makes it a CI rot gate. `open` is not: it drops the steps it cannot play,
 says which, and plays the rest. It refuses only a tour with nothing left.
 
-cmux is the only terminal backend in v0.1. It is detected automatically, and
-any other terminal is refused by name rather than half-worked around — you
-cannot tell "unsupported" from "broken" once something half-works. Adding a
+cmux and tmux are the terminal backends. Whichever you are in is detected
+automatically, and any other terminal is refused by name rather than
+half-worked around — you cannot tell "unsupported" from "broken" once
+something half-works. Adding a
 backend is one file, backends/<name>.sh, defining backend_open and
 backend_close; set WALKTHROUGH_BACKEND=<name> to choose one yourself.
 EOF
