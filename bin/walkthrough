@@ -94,13 +94,18 @@ wt_workspace_root() {
   printf '%s\n' "$root"
 }
 
+# Returns non-zero rather than exiting, and every caller that has nothing left
+# to do says `|| exit 1` for itself. `close` is the reason: it has cleanup to
+# perform that matters MORE when the backend is missing, not less, and an exit
+# in here ran before any of it (#16).
 load_backend() {
   BACKEND="$(wt_detect_backend)"
   # The backend name indexes a file we are about to source. Anything outside
   # this alphabet (a `/`, a `..`) would let an environment variable pick an
   # arbitrary file to execute.
-  [[ "$BACKEND" =~ ^[a-z0-9_]+$ ]] || die "invalid backend name: $BACKEND"
-  wt_require_backend "$BACKEND" || exit 1
+  [[ "$BACKEND" =~ ^[a-z0-9_]+$ ]] \
+    || { echo "walkthrough: invalid backend name: $BACKEND" >&2; return 1; }
+  wt_require_backend "$BACKEND" || return 1
   # shellcheck disable=SC1090
   . "$ROOT/backends/$BACKEND.sh"
 }
@@ -286,7 +291,8 @@ cmd_open() {
     echo "walkthrough: dropping unplayable step(s); the rest of the tour plays:" >&2
     while IFS= read -r line; do echo "  $line" >&2; done <<< "$skips"
   fi
-  load_backend
+  # Nothing to open without a surface to open it in, so this one aborts.
+  load_backend || exit 1
 
   # NUL-separated so a source path containing a space (or a newline) arrives
   # whole. The old `set -- $files` word-split BEFORE wt_nvim_cmd's `printf %q`
@@ -388,6 +394,7 @@ cmd_reload() {
 }
 
 cmd_close() {
+  local rc=0
   [ -f "$STATE" ] || return 0
   state_read
   # Use the backend RECORDED when the tour was opened, not whatever the
@@ -396,9 +403,28 @@ cmd_close() {
   # the state file directly contradicts — and left both the tab and the stale
   # state file behind. The _close_surface arm below already worked this way.
   WALKTHROUGH_BACKEND="$ST_backend"
-  load_backend
-  backend_close "$ST_handle"
+  if load_backend; then
+    backend_close "$ST_handle"
+  else
+    # The backend file itself is gone — a partial install, or the checkout was
+    # moved out from under the symlinked bundle, which the README warns about.
+    #
+    # This used to exit HERE, before the state file was removed, so the one
+    # thing `close` could still do was the thing it did not do: the surface
+    # stayed open (nothing can close it without its backend) AND the stale
+    # state survived, so every later `step` and `reload` addressed a
+    # walkthrough the user had been told was closed. Failing loudly is right;
+    # failing loudly and leaving the wreckage is not.
+    #
+    # So the record goes, and the handle goes to the user, who is now the only
+    # one who can close that surface.
+    rc=1
+    echo "walkthrough: the surface is still open and cannot be closed from here." >&2
+    echo "  backend: $ST_backend   handle: $ST_handle" >&2
+    echo "  Close it by hand; the walkthrough's own state has been cleared." >&2
+  fi
   rm -f "$STATE" "$ST_socket"
+  return "$rc"
 }
 
 usage() {
@@ -439,7 +465,9 @@ case "${1:-}" in
   list) shift; cmd_list "$@" ;;
   validate) shift; cmd_validate "$@" ;;
   schema) cmd_schema ;;
-  _close_surface) shift; WALKTHROUGH_BACKEND="${1:-}"; load_backend; backend_close "${2:-}" ;;
+  # The plugin closing its own surface: there is no state file here to clean
+  # up (the CLI's `close` owns that), so a missing backend leaves nothing to do.
+  _close_surface) shift; WALKTHROUGH_BACKEND="${1:-}"; load_backend || exit 1; backend_close "${2:-}" ;;
   -h|--help|help|"") usage ;;
   *) die "unknown command: $1 (try --help)" ;;
 esac

@@ -260,6 +260,42 @@ check "I-1 close uses the recorded backend, not re-detection" "0" "$i1"
 check "I-1 close clears the state file" "0" "$i1s"
 
 # ---------------------------------------------------------------------------
+# I-1b — ...and it clears the state file even when the BACKEND itself is gone
+#
+# `load_backend` exited on a backend file it could not find, and it was called
+# before the cleanup. So the one case where `close` can do least — a partial
+# install, or a checkout moved out from under the symlinked bundle, which the
+# README warns about — was the case where it also did nothing: the surface
+# stayed open (nothing can close it without its backend) AND the stale state
+# survived it, so every later `step` addressed a walkthrough the user had just
+# been told they closed.
+#
+# Loud is right. Loud and leaving the wreckage is not: the failure is reported,
+# the handle is handed to the user (who is now the only one who can close that
+# surface), and the record of a walkthrough that is no longer running goes.
+# ---------------------------------------------------------------------------
+printf 'not a socket\n' > "$WORK/i1b.sock"
+plant_state absent_backend surface-42 "$WORK/i1b.sock" "$WORK/t.tour"
+i1bout="$(env -u CMUX_SURFACE_ID -u TMUX -u WALKTHROUGH_BACKEND "$WT" close 2>&1)"
+check "I-1b close still fails when the recorded backend is missing" "1" "$?"
+printf %s "$i1bout" | grep -q "no backend for 'absent_backend'"
+check "I-1b ...naming the backend it could not load" "0" "$?"
+printf %s "$i1bout" | grep -q 'surface-42'
+check "I-1b ...and the handle, so the surface can be closed by hand" "0" "$?"
+[ -e "$STATE_FILE" ] && i1bs=1 || i1bs=0
+check "I-1b ...but the state file is gone" "0" "$i1bs"
+[ -e "$WORK/i1b.sock" ] && i1bk=1 || i1bk=0
+check "I-1b ...and so is the socket it named" "0" "$i1bk"
+
+# The consequence that made this worth fixing: with the state gone, a later
+# `step` is refused as "no active walkthrough" instead of addressing the
+# walkthrough the user believes they closed.
+i1bstep="$("$WT" step +1 2>&1)"
+check "I-1b a later step is refused" "1" "$?"
+printf %s "$i1bstep" | grep -q 'no active walkthrough'
+check "I-1b ...because there is no walkthrough left to address" "0" "$?"
+
+# ---------------------------------------------------------------------------
 # I-2 — a source path containing a space survives to the player
 #
 # `set -- $files` word-split before wt_nvim_cmd's `printf %q` ran, so it quoted
