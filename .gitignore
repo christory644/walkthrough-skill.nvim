@@ -3,3 +3,11 @@
 .tmp/
 .worktrees/
 .claude/
+
+# install.sh links the bundle's parts in beside SKILL.md so the skill directory
+# is self-contained and can be published as a single symlink. Anchored, because
+# an unanchored `lua` would ignore the renderer itself.
+/skills/walkthrough/bin
+/skills/walkthrough/backends
+/skills/walkthrough/lua
+/skills/walkthrough/schema.json
