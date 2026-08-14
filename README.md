@@ -33,6 +33,10 @@ lives in the repo and fails CI when it rots. Playing one requires no agent.
 - nvim 0.10+ (vim is not supported — see below)
 - [cmux](https://cmuxterm.com) — the only terminal backend in v0.1
 
+Both are for *playing* a walkthrough. Writing one needs neither, which is what
+makes the skill useful in a GUI editor — see
+[If your agent lives in a GUI editor](#if-your-agent-lives-in-a-gui-editor).
+
 Backends are pluggable and auto-detected; cmux is simply the one that ships
 first. Adding another is one file defining `backend_open` and `backend_close`.
 A detected-but-unimplemented terminal (e.g. tmux, which is detected but has no
@@ -62,6 +66,12 @@ That links the bundle into `~/.agents/skills/`, which Claude Code, Codex, Cursor
 Copilot, Gemini CLI, Amp and others all read. Then ask your agent to walk you
 through something.
 
+It also links into a harness's own directory when it finds one — every
+`~/.claude*` and `~/.codex*` profile you have, plus `$CODEX_HOME` or
+`$CLAUDE_CONFIG_DIR` when either is set, since those are the authoritative
+answer to where that harness lives. It never creates a directory it merely
+guessed at, and it refuses, by name, to touch anything it did not put there.
+
 Putting `bin/` on `PATH` is optional, and only needed to drive the CLI by hand.
 
 The install is symlinks pointing **into this checkout** — nothing is copied. Keep
@@ -69,6 +79,13 @@ it where it is: moving or deleting the repository leaves the installed skill
 pointing at nothing, and the first sign is usually an agent that can no longer
 open a walkthrough. If you do move it, re-run `./install.sh` from the new
 location.
+
+Part of that happens inside the checkout: `install.sh` links `bin/`, `backends/`,
+`lua/` and `schema.json` in beside `skills/walkthrough/SKILL.md` so that one
+directory is the whole skill, and then installs it as a single symlink. Those
+links are git-ignored and relative, so they survive the checkout moving. A skill
+has to be one self-contained directory for a harness scanner to find it — a
+directory of individually-linked files is not the same thing, and Codex skips it.
 
 ## Use
 
@@ -107,6 +124,33 @@ require("walkthrough").setup({
   keys = { next = "]w", prev = "[w", close = "<leader>aq" },
 })
 ```
+
+### If your agent lives in a GUI editor
+
+Authoring a tour and playing one are separable, and only playing needs a
+terminal.
+
+Any agent that can read code and run `walkthrough validate` writes a good tour.
+A Cursor session did exactly that unprompted — mapped a subsystem, chose the
+narrative order, co-located a durable tour under the package it explains, got
+the path form right and validated it. What it could not do was play it:
+`walkthrough open` drives a real nvim inside a terminal the CLI controls, and an
+agent embedded in VS Code or Cursor has no such surface. So it says so:
+
+```
+walkthrough: no backend for 'none'.
+```
+
+That is the design working, not a broken install — and your tour is not lost.
+It is a CodeTour file, unmodified, so open it with
+[the CodeTour extension](https://github.com/microsoft/codetour) in the editor
+you are already in. Discovery is `**/*.tour`, so a co-located tour is found
+wherever the agent put it, and the only difference is presentation: CodeTour
+renders the description as markdown where nvim draws it as plain text.
+
+In short — a terminal agent writes the tour and plays it in nvim; a GUI-editor
+agent writes the same tour and you play it with CodeTour. Both produce the same
+committed artifact, which is the point of using CodeTour's format.
 
 ### Driving it by hand
 

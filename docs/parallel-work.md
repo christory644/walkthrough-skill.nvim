@@ -9,7 +9,7 @@ one session's test run silently deciding another session's verdict.
 | Resource | How it is kept private | Where |
 | --- | --- | --- |
 | The CLI state file | `XDG_RUNTIME_DIR` points at the suite's own temp dir, so `walkthrough open/step/close` cannot see — or disturb — a walkthrough anyone actually has open | `tests/test_cli.sh` |
-| The installer's targets | a scratch `HOME` from `mktemp -d`; `install.sh` writes symlinks into `~/.agents`, `~/.claude`, … and must never be pointed at a real one, least of all for the refusal cases | `tests/test_skill_bundle.sh` |
+| The installer's targets | a scratch `HOME` from `mktemp -d`, **and** `CODEX_HOME` / `CLAUDE_CONFIG_DIR` cleared — see below; `install.sh` writes symlinks into `~/.agents`, `~/.claude`, … and must never be pointed at a real one, least of all for the refusal cases | `tests/test_skill_bundle.sh` |
 | nvim processes and sockets | started by the suite, recorded by PID, killed by that PID in an `EXIT` trap | `tests/test_cli.sh`, `tests/test_with_lock.sh` |
 | Scratch files | one `mktemp -d` per suite, removed on exit; nothing is written into the checkout | all shell suites |
 | The checkout itself | one `git worktree` per session | `.worktrees/` |
@@ -17,6 +17,32 @@ one session's test run silently deciding another session's verdict.
 **Never `pkill nvim`** (or `pkill -f walkthrough`, or anything else matched by
 name). The name belongs to every other session on the machine as well, and to
 the user's own editor. Kill the PIDs you started, and only those.
+
+## A scratch `HOME` is no longer enough for `install.sh`
+
+`install.sh` honours `$CODEX_HOME` and `$CLAUDE_CONFIG_DIR` and installs into
+whatever they name, creating it if absent. That is correct for a user — those
+variables are the authoritative statement of where a harness lives — and it is
+an escape hatch straight out of your sandbox, because neither is relative to
+`$HOME`.
+
+This is not hypothetical. `CLAUDE_CONFIG_DIR` is set to `~/.claude-personal` in
+at least one agent harness on this machine, and a run of
+`tests/test_skill_bundle.sh` with a perfectly good scratch `HOME` replaced the
+developer's live `~/.claude-personal/skills/walkthrough` with a link into a
+`mktemp -d` that the suite then deleted — a dangling skill in a real config
+directory, from a test that reported success.
+
+So clear both, every time:
+
+```sh
+env -u CODEX_HOME -u CLAUDE_CONFIG_DIR HOME="$scratch" ./install.sh
+```
+
+`tests/test_skill_bundle.sh` routes every invocation through an
+`install_scratch` helper that does exactly this, and sets the variables
+deliberately only in the cases that are *about* them, pointed inside the
+scratch tree. Do the same in anything you run by hand.
 
 ## The one thing that cannot be namespaced: cmux
 
@@ -75,6 +101,7 @@ including a run with the atomic acquire neutered, which must fail.
   push or PR they were making lands as the wrong user or not at all. Work with
   whatever account is already active, and ask the human if it is wrong.
 * **Do not run `install.sh` against your real `$HOME`** while testing. Give it
-  a scratch one.
+  a scratch one, and clear `CODEX_HOME` and `CLAUDE_CONFIG_DIR` as well — a
+  scratch `HOME` alone does not contain it.
 * **Kill what you start**, by PID, before you finish.
 * **Leave no artifacts:** `git status --porcelain` is clean when you are done.

@@ -137,6 +137,20 @@ what you picked in one line before you build it, so a wrong guess is cheap.
 6. **Open the walkthrough:** `walkthrough open <tour>` — it prints a handle and
    a socket.
 
+   **If it answers `no backend for '...'`, the task still succeeded.** Playing
+   needs a terminal the CLI can drive, and an agent embedded in a GUI editor —
+   VS Code, Cursor — has no such surface. That is structural, not a fault: no
+   retry, no flag and no other invocation will conjure one, and the CLI is
+   refusing rather than half-working on purpose.
+
+   Authoring is the part that needed you, and it is done. Say so plainly rather
+   than reporting a failure: give the tour's path, say it is a CodeTour file,
+   and tell the user to open it with the CodeTour extension in the editor they
+   are already in (it discovers `**/*.tour`, so it finds the tour wherever you
+   co-located it). Then narrate the shape as in step 7 and answer questions from
+   the terminal. Do not delete the tour, do not retry `open`, and do not go
+   hunting for another way to launch nvim.
+
 7. **Narrate the shape in the terminal** — what the tour covers and where to
    start. The user reads the detail in nvim; do not paste the descriptions back.
 
@@ -168,6 +182,12 @@ reader somewhere subtly wrong.
 
 - **Never claim the walkthrough is open without checking** — `open` prints a
   handle and socket, and fails loudly otherwise.
+- **No terminal backend is not a failed walkthrough.** Authoring is
+  editor-agnostic; only playing in nvim needs a terminal. When there is no
+  backend, hand over the tour and the CodeTour route (step 6). Treating an
+  editor that structurally cannot host the player as a bug to work around is
+  the one response that wastes the user's time and loses them a tour they
+  already had.
 - **If a command reports the walkthrough is gone**, the user closed it. Say so and
   continue in the terminal. Do not reopen it; they closed it deliberately.
 - **Do not close the walkthrough yourself.** The user's close key does it and
