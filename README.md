@@ -31,16 +31,31 @@ lives in the repo and fails CI when it rots. Playing one requires no agent.
 ## Requirements
 
 - nvim 0.10+ (vim is not supported — see below)
-- [cmux](https://cmuxterm.com) — the only terminal backend in v0.1
+- a terminal with a backend: [cmux](https://cmuxterm.com) or
+  [tmux](https://github.com/tmux/tmux)
 
 Both are for *playing* a walkthrough. Writing one needs neither, which is what
 makes the skill useful in a GUI editor — see
 [If your agent lives in a GUI editor](#if-your-agent-lives-in-a-gui-editor).
 
-Backends are pluggable and auto-detected; cmux is simply the one that ships
-first. Adding another is one file defining `backend_open` and `backend_close`.
-A detected-but-unimplemented terminal (e.g. tmux, which is detected but has no
-backend file) fails loudly rather than falling back to something half-working.
+Backends are pluggable and auto-detected: `$CMUX_SURFACE_ID` selects cmux,
+`$TMUX` selects tmux, and cmux wins when both are set, because then you are
+inside cmux running tmux and the outer multiplexer owns the surface you actually
+see. Each opens a dedicated surface beside your work — a cmux tab or a tmux
+window, never a split of the pane you were using — and returns your focus when
+the walkthrough ends.
+
+Adding a third is one file, `backends/<name>.sh`, defining `backend_open` and
+`backend_close`. A terminal with no backend fails loudly rather than falling
+back to something half-working:
+
+```
+walkthrough: no backend for 'none'.
+```
+
+The lines after that one list the backends actually on disk, rather than a set
+written down somewhere, so the message stays correct as backends are added
+without anyone having to remember it.
 
 ### Why not vim?
 
@@ -134,8 +149,9 @@ Any agent that can read code and run `walkthrough validate` writes a good tour.
 A Cursor session did exactly that unprompted — mapped a subsystem, chose the
 narrative order, co-located a durable tour under the package it explains, got
 the path form right and validated it. What it could not do was play it:
-`walkthrough open` drives a real nvim inside a terminal the CLI controls, and an
-agent embedded in VS Code or Cursor has no such surface. So it says so:
+`walkthrough open` drives a real nvim inside a terminal the CLI controls, and the
+shell an agent embedded in VS Code or Cursor runs commands in is usually not one.
+So it says so:
 
 ```
 walkthrough: no backend for 'none'.
@@ -151,6 +167,12 @@ renders the description as markdown where nvim draws it as plain text.
 In short — a terminal agent writes the tour and plays it in nvim; a GUI-editor
 agent writes the same tour and you play it with CodeTour. Both produce the same
 committed artifact, which is the point of using CodeTour's format.
+
+The split is about the terminal, not the editor, so it moves if your terminal
+does: an editor whose integrated shell is itself running inside cmux or tmux
+sets `$CMUX_SURFACE_ID` or `$TMUX`, and `open` will work from there like any
+other terminal. Worth knowing before you conclude your editor cannot play a
+tour — check what the agent's shell is actually running in.
 
 ### Driving it by hand
 
@@ -241,8 +263,8 @@ sentences and both are happy.
   [`deferred-by-design`](https://github.com/christory644/walkthrough-skill.nvim/issues?q=is%3Aissue+is%3Aopen+label%3Adeferred-by-design)
   are deliberate: the reasoning for keeping the current behaviour is in the issue.
 - [Good first issues](https://github.com/christory644/walkthrough-skill.nvim/labels/good%20first%20issue) —
-  including a tmux backend, which is one file and the highest-leverage thing
-  anyone could add.
+  a backend for another terminal is still the highest-leverage thing anyone
+  could add, and it is one file: cmux and tmux are the worked examples.
 - [`docs/implementation-notes.md`](docs/implementation-notes.md) — where the
   shipped code diverges from the plan and spec in `docs/`, and
   why. Read it before trusting either of those documents.
