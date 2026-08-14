@@ -60,6 +60,30 @@ jobs:
       # guard nothing ever executes is a guard nobody notices breaking.
       - name: cmux backend (skips outside cmux)
         run: ./tests/test_backend_cmux.sh
+      # The launch command is typed into whatever shell the user happens to
+      # run, so this hands the real emitted string to every shell installed
+      # and compares the argv that arrives (an nvim stub on PATH, no editor
+      # launched). The extra shells are what give it teeth: /bin/sh on this
+      # runner is dash, which is precisely the shell that used to open a
+      # DIFFERENT FILE in silence (#14).
+      - name: install extra shells for the quoting matrix
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ksh tcsh fish
+      - name: launch-command quoting, across shells
+        run: ./tests/test_backend_quoting.sh
+      # The socket wait: how many processes it spawns while nothing is
+      # listening (must be none) and whether its diagnostic distinguishes
+      # "nvim never started" from "nvim never answered" (#17).
+      - name: socket readiness and diagnostics
+        run: ./tests/test_backend_socket.sh
+      # tmux, unlike cmux, does NOT need to be skipped here. `tmux -L <name>`
+      # starts a private server that shares nothing with any other tmux, so
+      # the suite re-runs itself inside one and gets full coverage on a
+      # headless runner -- focus transitions, teardown and all.
+      - name: tmux backend (self-hosts a private tmux server)
+        run: ./tests/test_backend_tmux.sh
+      # ...and the plain SKIP path, for a machine with no tmux at all.
+      - name: tmux backend skips cleanly when told not to self-host
+        run: WALKTHROUGH_TMUX_SELFHOST=0 ./tests/test_backend_tmux.sh
 
   # The fuller fuzz: all three positions of the field x value matrix (~1700
   # documents), and every tenth document ALSO validated out of process by a real

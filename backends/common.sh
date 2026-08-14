@@ -92,6 +92,24 @@ wt_require_backend() {
   return 0
 }
 
+# The label a backend puts on the surface it opens (#24).
+#
+# Nothing marked the walkthrough surface, so in a tab list it was
+# indistinguishable from a terminal the user had started themselves -- its
+# title showed the working directory, exactly like any other shell. Found by
+# live use: the owner lost track of which tab the walkthrough was in.
+#
+# The default is a constant, deliberately. A backend is handed a command
+# string and nothing else -- it does not know the tour's title, and digging it
+# back out of the launch command would couple every backend to the CLI's
+# argument order. WALKTHROUGH_TITLE is the seam for a caller that does know.
+wt_title_text() { printf '%s' "${WALKTHROUGH_TITLE:-◆ walkthrough}"; }
+
+# Labelling a surface is optional. A backend that cannot do it is not a
+# special case at the call site -- it inherits this no-op and succeeds, so
+# callers never branch on which backend is loaded.
+backend_title() { return 0; }
+
 # Readiness is the socket, never the shell prompt: a slow or broken shell rc
 # can leave a terminal that never reaches a prompt at all.
 #
@@ -181,10 +199,13 @@ wt_b64() { printf %s "$1" | base64 | tr -d '\n'; }
 #
 #   sh/bash/zsh/ksh   $'nl\nb.txt'  -> correct
 #   dash              $'nl\nb.txt'  -> opens a file literally named $nl\nb.txt
+#   fish              $'nl\nb.txt'  -> likewise: a different file, no error
 #   csh/tcsh          $'nl\nb.txt'  -> "Illegal variable name."
 #
-# dash is the one that matters: it does not fail, it silently opens a
-# different file. A wrong walkthrough is worse than no walkthrough.
+# dash and fish are the ones that matter: they do not fail, they silently open
+# a different file. A wrong walkthrough is worse than no walkthrough. (The
+# issue is titled for csh and fish; measurement added dash and moved fish from
+# the loud column to the silent one.)
 #
 # POSIX single-quote armour instead: everything between '...' is literal in
 # every one of those shells, and an embedded quote closes the run, contributes
