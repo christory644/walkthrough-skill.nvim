@@ -5,10 +5,23 @@
 # The directive names the dialect for shellcheck without pretending otherwise.
 # shellcheck shell=bash
 TMUX_BIN="${TMUX_BIN:-$(command -v tmux || echo tmux)}"
-# A tmux window ID: @ followed by digits. NOT session:index -- an index shifts
-# as windows come and go, exactly like a cmux positional ref, and will
-# eventually name someone else's window.
-TMUX_WINDOW_RE='@[0-9]+'
+# Is this a tmux window id -- @ followed by digits, the WHOLE of it and
+# nothing else? NOT session:index: an index shifts as windows come and go,
+# exactly like a cmux positional ref, and will eventually name someone else's
+# window.
+#
+# Deliberately not `grep -qE '^@[0-9]+$'`, which is what the cmux backend used
+# and what this was first written as. That reads as an anchored match and is
+# not one: grep works a LINE at a time, so any value whose FIRST line is a
+# well-formed id passes, and the rest of it is handed to tmux regardless.
+# Handles are decoded from base64 in the CLI's state file, so a value carrying
+# a newline can genuinely arrive here. `*[!0-9]*` is a whole-string test and
+# rejects a newline along with everything else that is not a digit.
+tmux_is_window_id() {
+  case "$1" in @?*) ;; *) return 1 ;; esac
+  case "${1#@}" in *[!0-9]*) return 1 ;; esac
+  return 0
+}
 
 # ---------------------------------------------------------------------------
 # Teardown, measured -- and it is NOT the cmux mechanism.
@@ -81,7 +94,7 @@ backend_open() {
   # not get to choose rather than with `printf %q` (#14).
   handle="$("$TMUX_BIN" new-window -d -P -F '#{window_id}' \
     -a -t "$caller" -n "$(wt_title_text)" "$cmd" 2>/dev/null)"
-  echo "$handle" | grep -qE "^$TMUX_WINDOW_RE\$" || {
+  tmux_is_window_id "$handle" || {
     echo "walkthrough: tmux did not return a window id (got: '$handle')" >&2
     return 1
   }
@@ -91,7 +104,7 @@ backend_open() {
 }
 
 backend_title() { # $1 = window id, $2 = text
-  echo "$1" | grep -qE "^$TMUX_WINDOW_RE\$" || return 1
+  tmux_is_window_id "$1" || return 1
   "$TMUX_BIN" rename-window -t "$1" "$2" >/dev/null 2>&1
 }
 
@@ -102,7 +115,7 @@ backend_close() {
   # well-formed id (`@99999`) correctly exits 1, so only the empty and
   # malformed cases need catching here, and both are caught before tmux is
   # ever invoked.
-  echo "$1" | grep -qE "^$TMUX_WINDOW_RE\$" || return 1
+  tmux_is_window_id "$1" || return 1
 
   # And never close the window we were called from. $TMUX_PANE belongs to the
   # session driving us; killing it takes the caller down with it.

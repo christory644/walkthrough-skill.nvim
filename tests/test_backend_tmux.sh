@@ -169,51 +169,20 @@ if wait_focus "$away"; then ok "teardown lands where the reader actually was"
 else bad "landed on $(focused), expected the wandered-to window $away"; fi
 "$TM" kill-window -t "$away" 2>/dev/null
 
-# ---------------------------------------------------------------------------
-# The guard, tested WITHOUT letting a bad argument reach tmux.
+# What backend_close REFUSES is not tested here. It is the same rule for every
+# backend, it needs no multiplexer to check, and duplicating it per suite means
+# two places to update and one of them going stale -- see
+# tests/test_backend_guards.sh, which runs everywhere including CI.
 #
-# This is not hypothetical and not a style point. Measured on tmux 3.6a,
-# `kill-window -t ''` killed the session's remaining window AND EXITED 0 -- the
-# destructive case reports success. So the assertion is that tmux is never
-# invoked at all, which is also why TMUX_BIN is swapped for a recorder here
-# rather than running the real thing and inspecting the wreckage.
-echo "== backend_close refuses what it must, before tmux is called"
-REC="$(mktemp -d)"
-cat > "$REC/tmux" <<'STUB'
-#!/bin/sh
-printf '%s\n' "$*" >> "$TMUX_CALLS"
-# The guard asks which window the caller is in before refusing it, so the
-# recorder has to be able to answer that -- otherwise the "refuses the calling
-# window" case would pass for the wrong reason: an empty answer never matches,
-# so the guard would fall through and we would be measuring the stub.
-case "$1" in display-message) printf '%s\n' "$STUB_CALLER" ;; esac
-exit 0
-STUB
-chmod +x "$REC/tmux"
-export TMUX_CALLS="$REC/calls"
-export STUB_CALLER="$CALLER"
-
-refuses() { # $1 = label, $2 = handle it must refuse
-  : > "$TMUX_CALLS"
-  ( TMUX_BIN="$REC/tmux"; backend_close "$2" ) >/dev/null 2>&1
-  rc=$?
-  if [ "$rc" -eq 0 ]; then bad "$1: returned 0 (accepted it)"; return; fi
-  if grep -q 'kill-window' "$TMUX_CALLS" 2>/dev/null; then
-    bad "$1: refused but still ran kill-window [$(cat "$TMUX_CALLS")]"
-  else ok "$1: refused, and tmux was never asked to kill anything"; fi
-}
-refuses "an empty handle"        ""
-refuses "a malformed handle"     "not-a-window"
-refuses "a session:index ref"    "session:1"
-refuses "a shell-injection-ish handle" '@1; kill-server'
-refuses "the calling window"     "$CALLER"
-rm -rf "$REC"
-
-# A well-formed id that does not exist must be handled by tmux, not us: it is
-# indistinguishable from a window that closed a moment ago.
-: > /dev/null
-if backend_close "@99999" >/dev/null 2>&1; then ok "a stale-but-valid id is not an error"
-else ok "a stale-but-valid id reports failure (also acceptable)"; fi
+# What belongs here is the live half: a well-formed id for a window that no
+# longer exists must be tmux's problem, not ours. It is indistinguishable from
+# a window the reader closed a moment before teardown ran, which is a race
+# that happens in ordinary use.
+echo "== a valid id for a window that is already gone"
+before_stale="$(windows)"
+backend_close "@99999" >/dev/null 2>&1
+if [ "$(windows)" = "$before_stale" ]; then ok "a stale id harms nothing"
+else bad "a stale id changed the window set: [$before_stale] -> [$(windows)]"; fi
 
 [ "$fail" -eq 0 ] && echo "TMUX BACKEND PASSED"
 exit "$fail"
