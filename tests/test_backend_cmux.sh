@@ -3,6 +3,18 @@ set -u
 cd "$(dirname "$0")/.." || exit 1
 [ -n "${CMUX_SURFACE_ID:-}" ] || { echo "SKIP: not inside cmux"; exit 0; }
 
+# This test asserts that focus MOVED to the surface it opened and RETURNED when
+# it closed. Focus is one global property of the terminal, so a second session
+# opening or closing a surface mid-run flips those assertions and the test
+# reports a confident wrong answer. Take the mutex here rather than asking every
+# caller to remember: a safety rule nothing enforces is a safety rule that holds
+# right up until the day it matters. Skipping runs never reach this, so a
+# machine without cmux waits for nothing.
+if [ -z "${WALKTHROUGH_CMUX_LOCK_HELD:-}" ]; then
+  export WALKTHROUGH_CMUX_LOCK_HELD=1
+  exec ./scripts/with-lock cmux "$0" "$@"
+fi
+
 . ./backends/common.sh
 . ./backends/cmux.sh
 
