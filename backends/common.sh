@@ -94,13 +94,73 @@ wt_require_backend() {
 
 # Readiness is the socket, never the shell prompt: a slow or broken shell rc
 # can leave a terminal that never reaches a prompt at all.
+#
+# Two things were wrong with the old loop (#17).
+#
+# It polled with NO delay, so `tries` measured the machine's CPU rather than
+# any amount of time -- and every single try spawned a whole nvim just to ask
+# a question. 300 tries meant 300 processes racing the one nvim we were
+# waiting for. The wait was starving the thing it waited on.
+#
+# And it returned 1 in silence, so the caller had to invent a reason. The
+# caller's guess ("nvim never came up") cannot tell apart the two failures
+# that call for different repairs: nvim never STARTED, or nvim started and
+# never ANSWERED. The socket file distinguishes them, so this says which.
+#
+# Measured on this machine, socket that never appears, tries=300:
+#
+#                nvim processes spawned    wall clock
+#   before                          300         10.5s
+#   after                             0         11.3s
+#
+# The budget is deliberately left where it was -- the call site in cmd_open
+# picked 300 against a measured cold nvim start and lowering it would break
+# that -- but it is now spent WAITING rather than spinning, and `tries` is a
+# count of intervals instead of a measurement of how fast this CPU is. The
+# extra 0.8s is the poll interval times the cost of `sleep` being its own
+# process; it is only ever paid on a failure that was going to be reported.
+#
+# Fractional sleep is not in POSIX, but scripts/with-lock (LOCK_POLL=0.25) and
+# the cmux suite already require it, so this assumes no more than they do.
+WT_SOCKET_POLL="${WT_SOCKET_POLL:-0.03}"
+
 wt_wait_for_socket() {
-  sock="$1"; tries="${2:-60}"
-  i=0
-  while [ "$i" -lt "$tries" ]; do
-    if nvim --server "$sock" --remote-expr '1' >/dev/null 2>&1; then return 0; fi
-    i=$((i + 1))
+  _wt_sk="$1"; _wt_tries="${2:-60}"
+  _wt_i=0; _wt_seen=0; _wt_perr=''
+  _wt_t0="$(date +%s)"
+
+  while [ "$_wt_i" -lt "$_wt_tries" ]; do
+    # A stat, not a process. nvim binds the socket path when it is ready to
+    # serve it, so until that path exists there is nobody to ask and no
+    # reason to spawn anything -- which is exactly the window the old loop
+    # spent all its processes on. (`--listen` also accepts host:port, which
+    # never appears on disk, so the gate only applies to a path.)
+    case "$_wt_sk" in
+      */*) [ -S "$_wt_sk" ] && _wt_seen=1 ;;
+      *)   _wt_seen=1 ;;
+    esac
+    if [ "$_wt_seen" -eq 1 ]; then
+      # Keep the probe's own complaint: when the socket is there but nvim
+      # will not answer, that message is the only evidence of why.
+      _wt_perr="$(nvim --server "$_wt_sk" --remote-expr '1' 2>&1 >/dev/null)" && return 0
+    fi
+    _wt_i=$((_wt_i + 1))
+    sleep "$WT_SOCKET_POLL"
   done
+
+  _wt_el=$(( $(date +%s) - _wt_t0 ))
+  echo "walkthrough: nvim did not answer on $_wt_sk" >&2
+  if [ "$_wt_seen" -eq 0 ]; then
+    echo "  Waited ${_wt_el}s over $_wt_tries polls and the socket was never created," >&2
+    echo "  so nvim never started. Look at the surface that opened: a shell rc that" >&2
+    echo "  errors, or an nvim that exits during startup, both land here." >&2
+  else
+    echo "  Waited ${_wt_el}s over $_wt_tries polls. The socket exists, so nvim" >&2
+    echo "  started -- it just never answered. A configuration slow enough to miss" >&2
+    echo "  the budget is the usual cause." >&2
+    [ -n "$_wt_perr" ] && echo "  Last reply from the probe: $_wt_perr" >&2
+  fi
+  echo "  Raise the budget with WT_SOCKET_POLL (seconds per poll, now $WT_SOCKET_POLL)." >&2
   return 1
 }
 
