@@ -327,8 +327,21 @@ rm -f "$i2cmdfile"
     wt_wait_for_socket() { return 1; }
     cmd_open sp.tour
   ' _ ) >/dev/null 2>&1
-grep -qF -- "$(printf %q "$i2last")" "$i2cmdfile" 2>/dev/null
-check "I-2 cmd_open passes that path to the backend as one argument" "0" "$?"
+# Parse the captured command the way the shell that will run it does, and
+# assert the path arrives as exactly ONE argument.
+#
+# This used to grep for `printf %q`'s spelling of the path, which asserted a
+# quoting IMPLEMENTATION while claiming to assert the property in its own name.
+# The two parted company as soon as the implementation changed: `%q` emits
+# bash/zsh `$'...'` for a control character, which dash opens as a file
+# literally named `$nl\nb.txt` and csh refuses outright, so wt_nvim_cmd moved to
+# POSIX single-quote armour (#14) — and this check failed on a change that made
+# the thing it is named for MORE true. Parsing answers the real question, and
+# answers it the same way whatever the armour.
+i2args="$(bash -c 'eval "set -- $(cat "$1")"; printf "%s\n" "$@"' _ "$i2cmdfile" 2>/dev/null)"
+i2one=1
+[ "$(printf %s "$i2args" | grep -cxF -- "$i2last")" = "1" ] && i2one=0
+check "I-2 cmd_open passes that path to the backend as one argument" "0" "$i2one"
 
 # ---------------------------------------------------------------------------
 # I-4 — tour paths are absolutised, and an unresolvable one is an error
@@ -1081,5 +1094,11 @@ ws_expect "throwaway tour outside the repository" '*/ws/repo/src/app.txt'
 ws_open "$WORK/ws/loose" "loose.tour"
 ws_expect "no repository, invocation directory is the root" '*/ws/loose/src/app.txt'
 
-[ "$fail" -eq 0 ] && echo "CLI TESTS PASSED"
+# Say which it was, out loud. This printed the PASSED line or nothing at all,
+# so a failing run looked like a run whose tail had scrolled — and a reader
+# tailing the output (which is how anyone reads a suite this long) had to
+# remember to check `$?` to find out that it had failed. Every other suite here
+# prints a verdict; a suite that only announces success is one whose silence
+# gets read as success.
+if [ "$fail" -eq 0 ]; then echo "CLI TESTS PASSED"; else echo "CLI TESTS FAILED"; fi
 exit "$fail"
