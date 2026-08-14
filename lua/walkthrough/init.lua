@@ -89,7 +89,19 @@ local function teardown()
   state.augroup, state.active, state.tour, state.index, state.touched =
     nil, false, nil, 0, {}
   state.attached = {}
-  vim.fn.setqflist({}, "r", { title = "walkthrough", items = {} })
+  -- Clear the list we built, and only that one. The quickfix list is a single
+  -- global slot the reader can claim at any moment -- a `:grep` mid-tour makes
+  -- it theirs -- and this call used to empty whatever was in it, so closing a
+  -- walkthrough threw away results the reader had just gathered and could not
+  -- get back. `nav.is_our_qflist` is the same question nav already asks before
+  -- retitling a dropped step's entry; asking it in one place is what stops the
+  -- two answers drifting apart.
+  --
+  -- Leaving a foreign list untouched is not a leak: every walkthrough entry
+  -- went away with the list the reader replaced.
+  if nav.is_our_qflist() then
+    vim.fn.setqflist({}, "r", { title = "walkthrough", items = {} })
+  end
 end
 
 function M.open(path_or_tour)

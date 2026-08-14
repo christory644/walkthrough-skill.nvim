@@ -7,6 +7,22 @@ local M = {}
 -- appended to the title the entry already had. See mark_dropped_in_qflist.
 local DROPPED = "— DROPPED: this step could not be played"
 
+-- Every list this project creates is titled "walkthrough: <tour title>", and
+-- that prefix is the ONLY thing that distinguishes our list from the reader's
+-- own. The quickfix list is a single global slot: the reader can replace ours
+-- with a `:grep` at any moment, and anything we write into it afterwards is
+-- written into their results.
+--
+-- So: only ever edit our own list, asked in one place. Retitling a dropped
+-- step's entry (below) has always asked; teardown did not, and closing a
+-- walkthrough emptied whatever list happened to be current (#6).
+M.OWN_TITLE_PREFIX = "walkthrough: "
+
+function M.is_our_qflist(title)
+  if title == nil then title = vim.fn.getqflist({ title = 0 }).title end
+  return type(title) == "string" and title:sub(1, #M.OWN_TITLE_PREFIX) == M.OWN_TITLE_PREFIX
+end
+
 -- How a step titles its quickfix entry. Written once, because
 -- mark_dropped_in_qflist finds an entry by this exact text: if the two
 -- spellings drifted, a demoted step would quietly stop being marked.
@@ -146,7 +162,7 @@ local function mark_dropped_in_qflist(t, i)
   -- Only ever edit OUR list. The reader may have replaced the quickfix list
   -- with their own (a grep, a build); rewriting an entry in that one would be
   -- vandalism.
-  if type(qf.title) ~= "string" or qf.title:sub(1, 13) ~= "walkthrough: " then return end
+  if not M.is_our_qflist(qf.title) then return end
   local prefix = entry_prefix(t, i)
   for _, item in ipairs(qf.items or {}) do
     if type(item.text) == "string" and item.text:sub(1, #prefix) == prefix
