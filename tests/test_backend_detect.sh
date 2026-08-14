@@ -24,9 +24,70 @@ check "cmux wins over tmux"   "cmux" \
 check "unknown terminal"      "none" \
   "$(WALKTHROUGH_BACKEND='' CMUX_SURFACE_ID='' TMUX='' wt_detect_backend)"
 
-# a detected-but-unimplemented backend must fail loudly, not half-work
-( . ./backends/common.sh; wt_require_backend tmux ) >/dev/null 2>&1
+# A detected-but-unimplemented backend must fail loudly, not half-work.
+# The name here has to be one that genuinely ships no backend: this assertion
+# used to name tmux, which made it a test of "tmux is unimplemented" rather
+# than of the refusal, and it would have started failing the day tmux landed.
+( . ./backends/common.sh; wt_require_backend kitty ) >/dev/null 2>&1
 check "unimplemented backend errors" "1" "$?"
+
+# ...and an IMPLEMENTED one must not be refused. Without this the assertion
+# above passes just as happily when wt_require_backend refuses everything,
+# which is exactly the bug #18 produced.
+( . ./backends/common.sh; wt_require_backend cmux ) >/dev/null 2>&1
+check "implemented backend accepted" "0" "$?"
+
+# ---------------------------------------------------------------------------
+# Sourcing from a strict POSIX shell (#18)
+#
+# `${BASH_SOURCE[0]:-$0}` is a fatal `Bad substitution` under dash, and the
+# failed expansion left the root empty -- so the refusal that followed named a
+# backend that was present on disk. Both halves are asserted: no diagnostic
+# from the shell itself, and the right verdict for a backend that exists.
+#
+# /bin/sh is checked because that is what a third-party backend or an `sh`
+# test would use; on Linux CI it IS dash, while on macOS it is bash in POSIX
+# mode and cannot see this class of bug at all -- which is why dash is checked
+# by name as well whenever it is installed.
+# ---------------------------------------------------------------------------
+posix_source_check() { # $1 = shell to try
+  local sh="$1" out rc
+  command -v "$sh" >/dev/null 2>&1 || { echo "  skip: $sh not installed"; return; }
+  out="$("$sh" -c '. ./backends/common.sh; wt_require_backend cmux' 2>&1)"; rc=$?
+  check "$sh: sources and accepts cmux" "0" "$rc"
+  case "$out" in
+    *"Bad substitution"*|*"bad substitution"*)
+      echo "  FAIL: $sh: shell error while sourcing: $out"; fail=1 ;;
+    *"no backend for"*)
+      echo "  FAIL: $sh: refused a backend that exists: $out"; fail=1 ;;
+    *) echo "  ok: $sh: sourced without a shell diagnostic" ;;
+  esac
+}
+posix_source_check sh
+posix_source_check dash
+posix_source_check ksh
+
+# When the root genuinely cannot be found, the refusal must say THAT rather
+# than blaming the terminal. These are two different repairs, so they cannot
+# share a message. Run from a directory with no backends/ and no
+# WALKTHROUGH_ROOT, which is the only way POSIX sh can fail to locate itself.
+if command -v dash >/dev/null 2>&1; then
+  # Resolved HERE, before the cd: `$PWD` inside the subshell below would be
+  # `/`, and the test would silently source nothing and assert on the wrong
+  # failure. (It would still have gone green -- an unreadable file cannot
+  # define wt_require_backend either.)
+  here="$PWD"
+  root_msg="$(cd / && WALKTHROUGH_ROOT='' dash -c \
+    ". '$here'/backends/common.sh; wt_require_backend cmux" 2>&1)"
+  case "$root_msg" in
+    *"cannot locate the walkthrough checkout"*) echo "  ok: unlocatable root says so" ;;
+    *) echo "  FAIL: unlocatable root reported as: $root_msg"; fail=1 ;;
+  esac
+  # ...and WALKTHROUGH_ROOT is the documented escape hatch out of exactly that.
+  ( cd / && WALKTHROUGH_ROOT="$here" dash -c \
+      ". '$here'/backends/common.sh; wt_require_backend cmux" ) >/dev/null 2>&1
+  check "WALKTHROUGH_ROOT rescues an unlocatable root" "0" "$?"
+fi
 
 [ "$fail" -eq 0 ] && echo "BACKEND DETECT PASSED"
 exit "$fail"

@@ -14,17 +14,79 @@ wt_detect_backend() {
   echo "none"
 }
 
-# Only cmux ships in v0.1. Anything else must say so plainly: a half-working
+# Where this checkout lives.
+#
+# POSIX sh has no BASH_SOURCE, and the expansion this used to use --
+# ${BASH_SOURCE[0]:-$0} -- is not merely unavailable under dash but a fatal
+# `Bad substitution`. The damage was not the error line: the failed expansion
+# left `root` empty, so the refusal that followed named a backend that was
+# sitting right there on disk. The helper's failure to find ITSELF was reported
+# as the user's terminal being unsupported, which sends the reader to fix
+# something that was never wrong.
+#
+# So: candidates in order of authority, and -- the part that matters -- a
+# DIFFERENT refusal when none of them is a walkthrough checkout at all.
+wt_root() {
+  if [ -n "${WALKTHROUGH_ROOT:-}" ]; then printf '%s\n' "$WALKTHROUGH_ROOT"; return 0; fi
+
+  # ${BASH_SOURCE[0]} is array syntax, which dash cannot expand at all. `eval`
+  # keeps it out of dash's way (the string is only ever parsed by a shell that
+  # understands it), while bash still resolves it to the file the function was
+  # DEFINED in -- this one -- which is the whole reason to prefer it over $0.
+  _wt_src=''
+  if [ -n "${BASH_VERSION:-}" ]; then
+    _wt_src="$(eval 'printf %s "${BASH_SOURCE[0]:-}"' 2>/dev/null)"
+  fi
+  [ -n "$_wt_src" ] || _wt_src="$0"
+
+  # $0 is only a path when it contains a slash. Under `dash -c` it is the
+  # string "dash", and dirname would hand back "." -- a plausible-looking
+  # answer that is simply the caller's directory wearing a disguise.
+  case "$_wt_src" in
+    */*) _wt_cand="$(CDPATH='' cd -- "$(dirname -- "$_wt_src")/.." 2>/dev/null && pwd)" ;;
+    *)   _wt_cand='' ;;
+  esac
+  if [ -n "$_wt_cand" ] && [ -d "$_wt_cand/backends" ]; then
+    printf '%s\n' "$_wt_cand"; return 0
+  fi
+
+  # Last resort: the caller is standing in the checkout. This is what makes
+  # `sh -c '. ./backends/common.sh; ...'` work in a shell that cannot introspect
+  # its own source file.
+  if [ -d "$PWD/backends" ]; then printf '%s\n' "$PWD"; return 0; fi
+  return 1
+}
+
+# The backends actually present, one per line. Read off the disk rather than
+# hard-coded, so a refusal cannot go stale the moment a backend is added --
+# the old message said "v0.1 supports cmux" and would have kept saying it.
+wt_list_backends() {
+  _wt_root="$1"
+  for _wt_b in "$_wt_root"/backends/*.sh; do
+    [ -f "$_wt_b" ] || continue
+    _wt_b="${_wt_b##*/}"; _wt_b="${_wt_b%.sh}"
+    [ "$_wt_b" = "common" ] && continue   # helpers, not a backend
+    printf '%s\n' "$_wt_b"
+  done
+}
+
+# A detected terminal with no backend must say so plainly: a half-working
 # fallback is worse than a clear refusal, because the user cannot tell the
 # difference between "unsupported" and "broken".
 wt_require_backend() {
-  name="$1"
-  root="${WALKTHROUGH_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)}"
-  if [ ! -f "$root/backends/$name.sh" ]; then
-    echo "walkthrough: no backend for '$name'." >&2
-    echo "  v0.1 supports cmux. Adding a backend is one file:" >&2
-    echo "  backends/$name.sh defining backend_open and backend_close." >&2
-    echo "  Override detection with WALKTHROUGH_BACKEND." >&2
+  _wt_name="$1"
+  if ! _wt_r="$(wt_root)"; then
+    echo "walkthrough: cannot locate the walkthrough checkout (no backends/ found)." >&2
+    echo "  This is not about your terminal. Set WALKTHROUGH_ROOT to the" >&2
+    echo "  directory that contains backends/, or run from inside it." >&2
+    return 1
+  fi
+  if [ ! -f "$_wt_r/backends/$_wt_name.sh" ]; then
+    echo "walkthrough: no backend for '$_wt_name'." >&2
+    echo "  available: $(wt_list_backends "$_wt_r" | tr '\n' ' ')" >&2
+    echo "  Adding one is a single file: backends/$_wt_name.sh, defining" >&2
+    echo "  backend_open and backend_close. Override detection with" >&2
+    echo "  WALKTHROUGH_BACKEND." >&2
     return 1
   fi
   return 0
