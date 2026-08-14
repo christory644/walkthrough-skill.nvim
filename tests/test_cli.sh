@@ -296,6 +296,82 @@ printf %s "$i1bstep" | grep -q 'no active walkthrough'
 check "I-1b ...because there is no walkthrough left to address" "0" "$?"
 
 # ---------------------------------------------------------------------------
+# I-1c — close reports what the BACKEND reports (#29)
+#
+# `cmd_close` ran backend_close and then `rm`, and the `rm` status became the
+# script's: a surface that genuinely would not close was reported as closed, to
+# a shell and to the agent that SKILL.md tells to trust this exit status.
+#
+# The naive fix — propagate the backend's status — is worse than the bug, and
+# that is why this waited for a second backend. Both multiplexers report a
+# FAILURE for a surface that is simply already gone (measured: cmux
+# "Error: not_found", tmux "can't find window"), and already gone is the
+# ORDINARY path: the reader quits with <leader>aq or closes the tab long before
+# anyone runs `walkthrough close`. So the backends distinguish the two —
+# 0 closed, 2 nothing to close, other non-zero possibly still open
+# (backends/common.sh) — and this asserts the CLI reads all three, with the
+# three cases kept apart. Accepting "0 or 2" for the gone case would pass
+# against the old backends too, which returned 0 for everything.
+# ---------------------------------------------------------------------------
+close_reporting() { # $1 = status backend_close returns -> prints "<rc>|<stderr>"
+  plant_state cmux i1c-handle "$WORK/dead.sock" "$WORK/t.tour"
+  ( cd "$REPO" && REPO="$REPO" BRC="$1" bash -c '
+      set -uo pipefail
+      source "$REPO/bin/walkthrough" --help >/dev/null 2>&1
+      load_backend()  { BACKEND=stub; }
+      backend_close() { return "$BRC"; }
+      cmd_close
+    ' _ ) 2>"$WORK/i1c.err"
+  printf '%s|%s' "$?" "$(tr '\n' ' ' < "$WORK/i1c.err")"
+}
+
+i1c="$(close_reporting 0)"
+check "I-1c a backend that closed the surface exits 0" "0" "${i1c%%|*}"
+[ -e "$STATE_FILE" ] && i1cs=1 || i1cs=0
+check "I-1c ...and the state file is gone" "0" "$i1cs"
+
+i1c="$(close_reporting 2)"
+check "I-1c a surface that was already gone is NOT a failure" "0" "${i1c%%|*}"
+case "${i1c#*|}" in *"may still be open"*) i1cq=1 ;; *) i1cq=0 ;; esac
+check "I-1c ...and nothing is said about a surface left open" "0" "$i1cq"
+[ -e "$STATE_FILE" ] && i1cs=1 || i1cs=0
+check "I-1c ...and the state file is gone" "0" "$i1cs"
+
+i1c="$(close_reporting 1)"
+check "I-1c a backend that could NOT close the surface exits non-zero" "1" "${i1c%%|*}"
+case "${i1c#*|}" in *"may still be open"*) i1cq=0 ;; *) i1cq=1 ;; esac
+check "I-1c ...saying the surface may still be open" "0" "$i1cq"
+case "${i1c#*|}" in *i1c-handle*) i1ch=0 ;; *) i1ch=1 ;; esac
+check "I-1c ...and naming the handle, so it can be closed by hand" "0" "$i1ch"
+# Same rule as I-1b: loud is right, loud and leaving the wreckage is not. The
+# record of a walkthrough that may be half-torn-down must not survive to be
+# addressed by a later `step`.
+[ -e "$STATE_FILE" ] && i1cs=1 || i1cs=0
+check "I-1c ...but the state file is still cleared" "0" "$i1cs"
+rm -f "$STATE_FILE"
+
+# ...and the same contract through the REAL CLI, at the verb the plugin itself
+# runs when the reader presses <leader>aq. The multiplexer is a stub replaying
+# tmux's measured answers, so this needs no tmux and runs on CI: `kill-window`
+# for a window that is gone exits 1 with "can't find window", and it is the
+# window listing that says whether it is gone or still there.
+cat > "$WORK/stub-tmux" <<'STUB'
+#!/bin/sh
+case "$1" in
+  kill-window)  echo "can't find window: $2" >&2; exit 1 ;;
+  list-windows) printf '%s\n' "$STUB_WINDOWS"; exit 0 ;;
+esac
+exit 0
+STUB
+chmod +x "$WORK/stub-tmux"
+env -u TMUX_PANE TMUX_BIN="$WORK/stub-tmux" STUB_WINDOWS='@1' \
+  "$WT" _close_surface tmux "@7" >/dev/null 2>&1
+check "I-1c _close_surface exits 0 for a window that is already gone" "0" "$?"
+env -u TMUX_PANE TMUX_BIN="$WORK/stub-tmux" STUB_WINDOWS='@1
+@7' "$WT" _close_surface tmux "@7" >/dev/null 2>&1
+check "I-1c ...and non-zero for one the multiplexer would not close" "1" "$?"
+
+# ---------------------------------------------------------------------------
 # I-2 — a source path containing a space survives to the player
 #
 # `set -- $files` word-split before wt_nvim_cmd's `printf %q` ran, so it quoted

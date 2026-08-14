@@ -46,8 +46,28 @@ window, never a split of the pane you were using — and returns your focus when
 the walkthrough ends.
 
 Adding a third is one file, `backends/<name>.sh`, defining `backend_open` and
-`backend_close`. A terminal with no backend fails loudly rather than falling
-back to something half-working:
+`backend_close`. `backend_close` answers with one of three statuses, because
+`walkthrough close` reports what it says:
+
+| status | meaning |
+|---|---|
+| `0` | closed — the surface is gone because we asked |
+| `2` | nothing to close — it was already gone when we looked |
+| any other non-zero | refused, or attempted and the surface may still be open |
+
+`2` is not a formality. By the time anyone runs `walkthrough close` the reader
+has usually shut the surface themselves, and both multiplexers report *that* as
+a failure (measured: cmux `Error: not_found`, tmux `can't find window`), so a
+backend that hands its multiplexer's status back turns the ordinary teardown
+into an error. Attempt the close first; only if it fails, ask the multiplexer's
+own inventory (`cmux tree`, `tmux list-windows`) whether the surface is still
+there — absent is `2`, present is failure, and an inventory you could not read
+is failure too, since it is no evidence that anything closed. The reasoning and
+the measurements are in `backends/common.sh`; the rules are asserted for every
+backend at once in `tests/test_backend_guards.sh`.
+
+A terminal with no backend fails loudly rather than falling back to something
+half-working:
 
 ```
 walkthrough: no backend for 'none'.

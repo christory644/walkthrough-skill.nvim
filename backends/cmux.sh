@@ -58,13 +58,37 @@ backend_title() { # $1 = surface uuid, $2 = text
   "$CMUX_BIN" rename-tab --surface "$1" "$2" >/dev/null 2>&1
 }
 
+# Is this surface still one cmux knows about? Prints present / absent /
+# unknown -- see the backend_close contract in backends/common.sh.
+#
+# `--all`, because the tab can be dragged into another cmux window and a tree
+# scoped to the current one would then call a live surface absent. Measured:
+# `tree` lists a surface right up to the moment it closes and never after, and
+# a uuid is 36 characters of fixed shape, so a substring match cannot land
+# inside a different id.
+#
+# Output that cannot be read is `unknown`, never `absent`. An empty tree is the
+# same: cmux always has at least the surface we are running in, so nothing at
+# all means we did not reach cmux rather than that cmux has nothing.
+cmux_surface_state() { # $1 = surface uuid
+  local tree
+  tree="$("$CMUX_BIN" tree --all --id-format uuids 2>/dev/null)" \
+    || { echo unknown; return 0; }
+  [ -n "$tree" ] || { echo unknown; return 0; }
+  case "$tree" in
+    *"$1"*) echo present ;;
+    *)      echo absent  ;;
+  esac
+}
+
 backend_close() {
-  # Never hand cmux an empty or malformed surface argument. What cmux does
-  # with `close-surface --surface ""` is undetermined, and the standing rule
-  # is to never risk closing a surface we did not create. This is not
-  # theoretical caution: the tmux backend's equivalent was measured, and
-  # `kill-window -t ''` there killed the session's remaining window and
-  # exited 0 -- the destructive case reporting success.
+  # Never hand cmux an empty or malformed surface argument. `--surface` is an
+  # OPTIONAL flag (`cmux close-surface --help`), so an empty one does not fail
+  # -- it falls through to whatever cmux considers the current surface and
+  # closes that. This is not theoretical caution: the tmux backend's
+  # equivalent was measured, and `kill-window -t ''` there killed the
+  # session's remaining window and exited 0 -- the destructive case reporting
+  # success.
   cmux_is_surface_id "$1" || return 1
 
   # And never the caller's own surface. $CMUX_SURFACE_ID is the tab the
@@ -75,6 +99,20 @@ backend_close() {
     return 1
   fi
 
-  "$CMUX_BIN" close-surface --surface "$1" >/dev/null 2>&1
-  return 0
+  # Measured (cmux CLI shipped in /Applications/cmux.app, 2026-08), against a
+  # surface this backend had created moments before:
+  #
+  #   --surface <live>                 -> 0, "OK surface:132 workspace:1"
+  #   --surface <closed a moment ago>  -> 1, "Error: not_found: Surface not found"
+  #   --surface <never existed>        -> 1, the same message
+  #
+  # so the status says "failed" for the ordinary case where the reader had
+  # already closed the tab. It is the tree that can tell those apart.
+  if "$CMUX_BIN" close-surface --surface "$1" >/dev/null 2>&1; then
+    return 0
+  fi
+  case "$(cmux_surface_state "$1")" in
+    absent) return 2 ;;   # nothing to close -- see backends/common.sh
+    *)      return 1 ;;   # still there, or we could not find out
+  esac
 }

@@ -149,7 +149,9 @@ echo "== close"
 # neighbour to the right. The caller is the most recently used window at this
 # point, so it gets focus back with no focus call, which matters because a
 # process cannot talk to tmux after its own window is gone.
-backend_close "$handle"
+backend_close "$handle"; close_rc=$?
+if [ "$close_rc" = 0 ]; then ok "closing a live window reports 0 (closed)"
+else bad "closing a live window reported $close_rc, wanted 0"; fi
 if wait_focus "$CALLER"; then ok "focus returned to the caller"
 else bad "focus did not return to the caller (landed on $(focused))"; fi
 
@@ -186,9 +188,38 @@ else bad "landed on $(focused), expected the wandered-to window $away"; fi
 # that happens in ordinary use.
 echo "== a valid id for a window that is already gone"
 before_stale="$(windows)"
-backend_close "@99999" >/dev/null 2>&1
+backend_close "@99999" >/dev/null 2>&1; stale_rc=$?
 if [ "$(windows)" = "$before_stale" ]; then ok "a stale id harms nothing"
 else bad "a stale id changed the window set: [$before_stale] -> [$(windows)]"; fi
+
+# ...and it must SAY that there was nothing to close (#29), because `close`
+# reports what the backend reports and this is the ordinary teardown path: by
+# the time anyone runs `walkthrough close`, the reader has usually shut the
+# window themselves. tmux's own status cannot express it -- measured here on
+# 3.6a, `kill-window` for a window that is gone exits 1, exactly as it does
+# when a close genuinely fails -- so this asserts the DISTINCTION the backend
+# adds, not merely that the call succeeded. 0 would be the old bug (the status
+# thrown away), 1 would be a surface reported as stuck open when there is none.
+if [ "$stale_rc" = 2 ]; then ok "a window that is already gone reports 2 (nothing to close)"
+else bad "a window that is already gone reported $stale_rc, wanted 2"; fi
+
+# The same, for a window this suite really did open and really did close a
+# moment ago -- the actual shape of the ordinary path, rather than an id that
+# never existed.
+h3="$(backend_open "$(wt_nvim_cmd "$PWD" "$SOCK" tests/fixtures/alpha.txt)")"
+if tmux_is_window_id "$h3"; then
+  "$TM" kill-window -t "$h3" >/dev/null 2>&1     # the reader closes it themselves
+  i=0
+  while "$TM" list-windows -a -F '#{window_id}' | grep -qxF -- "$h3" && [ "$i" -lt 25 ]; do
+    sleep 0.2; i=$((i + 1))
+  done
+  backend_close "$h3" >/dev/null 2>&1; gone_rc=$?
+  if [ "$gone_rc" = 2 ]; then ok "a window the reader closed first reports 2 as well"
+  else bad "a window the reader closed first reported $gone_rc, wanted 2"; fi
+else
+  bad "could not open a third window to close by hand (got '$h3')"
+fi
+rm -f "$SOCK"
 
 [ "$fail" -eq 0 ] && echo "TMUX BACKEND PASSED"
 exit "$fail"

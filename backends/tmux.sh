@@ -108,6 +108,38 @@ backend_title() { # $1 = window id, $2 = text
   "$TMUX_BIN" rename-window -t "$1" "$2" >/dev/null 2>&1
 }
 
+# Is this window still one tmux knows about? Prints present / absent /
+# unknown -- see the backend_close contract in backends/common.sh.
+#
+# `list-windows -a`, not `display-message -p -t <id>`, which is the trap here:
+# measured on 3.6a, display-message for a window that no longer exists exits
+# **0** and prints an empty line, so a backend that read its status would call
+# a dead window live. The listing is unambiguous -- an id is either in it or it
+# is not.
+#
+# A server that is not running is `absent`, not `unknown`: a tmux window cannot
+# outlive its server, so "no server" is positive evidence that the walkthrough
+# window is gone. That case is the reader quitting tmux altogether with a
+# walkthrough still recorded, and it is the one place this reads tmux's message
+# rather than its status -- every OTHER failure of the listing is `unknown`,
+# because a tmux we cannot interrogate is not evidence that anything closed.
+tmux_window_exists() { # $1 = window id
+  local out rc
+  out="$("$TMUX_BIN" list-windows -a -F '#{window_id}' 2>&1)"; rc=$?
+  # An empty listing is `unknown`, never `absent`: a running server always has
+  # at least one window (it exits with its last), so nothing at all means we
+  # did not really reach tmux rather than that tmux has nothing.
+  if [ "$rc" -eq 0 ] && [ -n "$out" ]; then
+    if printf '%s\n' "$out" | grep -qxF -- "$1"; then echo present; else echo absent; fi
+    return 0
+  fi
+  [ "$rc" -eq 0 ] && { echo unknown; return 0; }
+  case "$out" in
+    *"no server running"*) echo absent ;;
+    *)                     echo unknown ;;
+  esac
+}
+
 backend_close() {
   # Never hand tmux an empty or malformed target. This is not hypothetical:
   # measured on tmux 3.6a, `kill-window -t ''` killed the session's remaining
@@ -127,6 +159,20 @@ backend_close() {
     }
   fi
 
-  "$TMUX_BIN" kill-window -t "$1" >/dev/null 2>&1
-  return 0
+  # Measured on tmux 3.6a, against a window created moments before:
+  #
+  #   kill-window -t <live>                -> 0
+  #   kill-window -t <killed a moment ago> -> 1, "can't find window: @1"
+  #   kill-window -t <never existed>       -> 1, "can't find window: @99999"
+  #   ...with the whole server gone        -> 1, "no server running on <sock>"
+  #
+  # so the status says "failed" for the ordinary case where the reader had
+  # already closed the window. The listing is what tells those apart.
+  if "$TMUX_BIN" kill-window -t "$1" >/dev/null 2>&1; then
+    return 0
+  fi
+  case "$(tmux_window_exists "$1")" in
+    absent) return 2 ;;   # nothing to close -- see backends/common.sh
+    *)      return 1 ;;   # still there, or we could not find out
+  esac
 }

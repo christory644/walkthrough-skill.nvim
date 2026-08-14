@@ -114,6 +114,64 @@ wt_require_backend() {
   return 0
 }
 
+# ---------------------------------------------------------------------------
+# What backend_close has to REPORT (#29)
+#
+# `walkthrough close` runs long after the reader has usually shut the surface
+# themselves -- with <leader>aq, or by closing the tab -- so "there was nothing
+# to close" is the ORDINARY path, not an error. It is also indistinguishable,
+# by exit status alone, from a close that was attempted and failed. Measured,
+# because both multiplexers were guessed wrong at first:
+#
+#   cmux  close-surface --surface <live>   -> 0, "OK surface:132 workspace:1"
+#         close-surface --surface <gone>   -> 1, "Error: not_found: Surface not found"
+#   tmux  kill-window   -t <live>          -> 0
+#         kill-window   -t <gone>          -> 1, "can't find window: @1"
+#
+# Both report a FAILURE for a surface that is simply no longer there, so a
+# backend that hands its multiplexer's status straight back turns the common,
+# correct teardown into a non-zero exit -- a worse lie than the swallowed
+# status this replaces. Both, however, can be ASKED: `cmux tree` and `tmux
+# list-windows` do not list a surface that is gone.
+#
+# So backend_close reports one of three things, and the CLI reads all three:
+#
+#   0                      closed: we asked, and the surface is gone because of it
+#   2  (WT_CLOSE_GONE)     nothing to close: it was already gone when we looked
+#   any other non-zero     refused, or attempted and the surface may still be open
+#
+# 0 and 2 are both success for the caller. They stay distinct because a test
+# that accepted either could not tell this contract from the bug it replaced --
+# the old backends returned 0 unconditionally, which is "success" for an
+# already-gone surface too.
+#
+# The shape every backend uses, and the one a third should copy:
+#
+#   1. refuse a handle that is not well-formed, and refuse the caller's own
+#      surface, BEFORE the multiplexer is invoked (tests/test_backend_guards.sh);
+#   2. attempt the close; if the multiplexer accepted it, return 0;
+#   3. only then ask the multiplexer's inventory whether that surface is still
+#      there. Absent -> 2. Present -> 1. Cannot tell -> 1.
+#
+# Ask AFTER the attempt, never before: a reader who closes the tab in the
+# second between a check and a close is an ordinary race, and asking afterwards
+# reports one verdict about one attempt rather than two answers about two
+# moments. And "cannot tell" must be a failure: an inventory that cannot be
+# read is not evidence that anything was closed.
+#
+# The status is spelled literally inside each backend: a backend is sourced on
+# its own by tests and could be by anything else, and `return "$WT_CLOSE_GONE"`
+# under `set -u` would turn a missing definition into a crash at teardown. The
+# name below is for the CLI, which always has this file, and for anyone
+# grepping for the contract.
+# ---------------------------------------------------------------------------
+# The reader of this is bin/walkthrough (cmd_close and _close_surface), one
+# file over, which is a use shellcheck cannot see from here. Not exported: it
+# is a constant for the processes that source this file, not something to
+# push into the environment of every nvim a backend launches.
+# shellcheck disable=SC2034
+WT_CLOSE_GONE=2
+
 # The label a backend puts on the surface it opens (#24).
 #
 # Nothing marked the walkthrough surface, so in a tab list it was

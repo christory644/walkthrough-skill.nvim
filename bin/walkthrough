@@ -394,7 +394,7 @@ cmd_reload() {
 }
 
 cmd_close() {
-  local rc=0
+  local rc=0 brc=0
   [ -f "$STATE" ] || return 0
   state_read
   # Use the backend RECORDED when the tour was opened, not whatever the
@@ -404,7 +404,30 @@ cmd_close() {
   # state file behind. The _close_surface arm below already worked this way.
   WALKTHROUGH_BACKEND="$ST_backend"
   if load_backend; then
-    backend_close "$ST_handle"
+    # The backend's verdict is this command's verdict (#29). It used to be
+    # thrown away — the `rm` below became the script's status — so a surface
+    # that genuinely would not close was reported as closed, and the agent
+    # driving this CLI was told the walkthrough was over.
+    #
+    # Propagating the raw status would have been the wrong fix, which is why
+    # this waited for a second backend to check the distinction against: BOTH
+    # multiplexers report a failure for a surface that is simply already gone,
+    # and already gone is the ORDINARY teardown path (the reader quits with
+    # <leader>aq, or closes the tab, long before anyone runs `close`). So the
+    # backends distinguish the two and this reads both answers — see the
+    # contract in backends/common.sh.
+    backend_close "$ST_handle"; brc=$?
+    case "$brc" in
+      0) ;;                       # closed, here and now
+      "${WT_CLOSE_GONE:-2}") ;;   # already gone: nothing to close, nothing wrong
+      *)
+        rc=1
+        echo "walkthrough: the backend could not close the surface, and it may still be open." >&2
+        echo "  backend: $ST_backend   handle: $ST_handle" >&2
+        echo "  Check it, and close it by hand if it is there; the walkthrough's" >&2
+        echo "  own state has been cleared." >&2
+        ;;
+    esac
   else
     # The backend file itself is gone — a partial install, or the checkout was
     # moved out from under the symlinked bundle, which the README warns about.
@@ -467,7 +490,18 @@ case "${1:-}" in
   schema) cmd_schema ;;
   # The plugin closing its own surface: there is no state file here to clean
   # up (the CLI's `close` owns that), so a missing backend leaves nothing to do.
-  _close_surface) shift; WALKTHROUGH_BACKEND="${1:-}"; load_backend || exit 1; backend_close "${2:-}" ;;
+  #
+  # "Already gone" is success here too, and it is a real case rather than a
+  # theoretical one: the reader can close the tab in the moment between
+  # <leader>aq firing this and the backend reaching the multiplexer. The
+  # backend's 2 is folded into 0 so this arm exits the way every other command
+  # does — see the contract in backends/common.sh.
+  _close_surface)
+    shift; WALKTHROUGH_BACKEND="${1:-}"; load_backend || exit 1
+    backend_close "${2:-}"; _rc=$?
+    [ "$_rc" = "${WT_CLOSE_GONE:-2}" ] && _rc=0
+    exit "$_rc"
+    ;;
   -h|--help|help|"") usage ;;
   *) die "unknown command: $1 (try --help)" ;;
 esac

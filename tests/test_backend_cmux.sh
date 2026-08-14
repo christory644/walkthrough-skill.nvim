@@ -126,8 +126,45 @@ fi
 # closed tab. That is undocumented behaviour we depend on and cannot correct
 # for, so a future cmux that changes it must break the build here rather than
 # quietly stranding users on a stranger's tab every time they quit a tour.
-backend_close "$handle"
+backend_close "$handle"; close_rc=$?
 wait_active "$CMUX_SURFACE_ID" || { focus_failure "$CMUX_SURFACE_ID" "return to the caller"; fail=1; }
+
+# What the close REPORTED, not just what it did (#29). `walkthrough close`
+# takes its own exit status from this, so the three answers have to be told
+# apart: 0 closed, 2 nothing to close, non-zero-and-not-2 possibly still open.
+[ "$close_rc" = 0 ] || { echo "FAIL: closing a live surface reported $close_rc, wanted 0"; fail=1; }
+
+# The ordinary teardown path, live. By the time anyone runs `walkthrough
+# close` the reader has usually shut the tab themselves, so the handle names a
+# surface that is already gone -- and cmux cannot say so in its exit status:
+# measured, `close-surface --surface <gone uuid>` exits 1 with
+# "Error: not_found: Surface not found", exactly as a genuine failure would.
+# The tree is what tells them apart, so this asserts both the parts: the query
+# reads the surface as gone, and the close reports 2 rather than the 1 cmux
+# handed it (which would report a surface stuck open when there is none) or
+# the 0 the old code returned unconditionally (the bug this replaces).
+#
+# Safe by measurement, not by hope: an unknown uuid is `not_found` to cmux and
+# closes nothing. `--surface` is an optional flag, so an EMPTY one falls
+# through to the current surface -- which is why backend_close refuses one
+# before cmux is ever invoked (tests/test_backend_guards.sh).
+if [ "$(cmux_surface_state "$handle")" = absent ]; then
+  echo "  ok: the tree reads the closed surface as gone"
+else
+  echo "FAIL: the tree still reads $handle as [$(cmux_surface_state "$handle")]"; fail=1
+fi
+if [ "$(cmux_surface_state "$CMUX_SURFACE_ID")" = present ]; then
+  echo "  ok: ...and reads the caller's own surface as present"
+else
+  echo "FAIL: the tree cannot see the caller's own surface -- the query is not answering"; fail=1
+fi
+backend_close "$handle" >/dev/null 2>&1; again_rc=$?
+if [ "$again_rc" = 2 ]; then
+  echo "  ok: closing a surface that is already gone reports 2 (nothing to close)"
+else
+  echo "FAIL: closing an already-gone surface reported $again_rc, wanted 2"; fail=1
+fi
+wait_active "$CMUX_SURFACE_ID" || { focus_failure "$CMUX_SURFACE_ID" "stay on the caller"; fail=1; }
 
 rm -f "$SOCK"
 [ "$fail" -eq 0 ] && echo "CMUX BACKEND PASSED"
