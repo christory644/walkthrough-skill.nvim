@@ -83,7 +83,9 @@ wt_require_backend() {
   fi
   if [ ! -f "$_wt_r/backends/$_wt_name.sh" ]; then
     echo "walkthrough: no backend for '$_wt_name'." >&2
-    echo "  available: $(wt_list_backends "$_wt_r" | tr '\n' ' ')" >&2
+    # paste, not `tr '\n' ' '`, which leaves a trailing space on a line that
+    # README and SKILL.md quote verbatim.
+    echo "  available: $(wt_list_backends "$_wt_r" | paste -sd' ' -)" >&2
     echo "  Adding one is a single file: backends/$_wt_name.sh, defining" >&2
     echo "  backend_open and backend_close. Override detection with" >&2
     echo "  WALKTHROUGH_BACKEND." >&2
