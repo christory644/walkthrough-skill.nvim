@@ -94,6 +94,33 @@ however the command ends — including on `Ctrl-C`, a `SIGTERM`, or a crash.
 `tests/test_with_lock.sh` proves all of the above under real concurrency,
 including a run with the atomic acquire neutered, which must fail.
 
+## Run the same shellcheck CI runs: **0.11.0**
+
+CI pins it (`.github/workflows/test.yml`, the "pin shellcheck" step). Match it
+locally, because an unpinned linter is not a gate — it is a moving target that
+happens to agree with you most days.
+
+```sh
+shellcheck --version     # want: 0.11.0
+```
+
+This is written down because of a real failure. The runner image shipped an
+older shellcheck that reported trap-invoked cleanup functions as **SC2317**
+("command appears to be unreachable") where 0.11.0 reports the same false
+positive as **SC2329**. Three sessions each verified `shellcheck rc=0`
+completely honestly, against a different tool than the one gating the build,
+and `main` was red for four pushes while every local run was green.
+
+Two lessons that generalise past shellcheck:
+
+* **Suppressing one code for a false positive is not enough** when another
+  version of the tool files the same complaint under a different code. The
+  cleanup functions in `scripts/with-lock`, `tests/test_backend_socket.sh` and
+  `tests/test_backend_tmux.sh` now disable both.
+* **"It passes locally" is a claim about your toolchain, not about the gate.**
+  If a tool decides whether work lands, pin it, and print its version in the
+  job so the next drift is visible in the log rather than in a mystery failure.
+
 ## Standing rules
 
 * **Nobody runs `gh auth switch`.** GitHub auth is global to the machine: a

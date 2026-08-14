@@ -356,11 +356,18 @@ release() {
 # command is killed first: leaving it running while the lock is released is
 # precisely the state the lock exists to prevent.
 #
-# shellcheck disable=SC2329
+# shellcheck disable=SC2329,SC2317
 # ^ "This function is never invoked": it is, from the two trap handlers below,
 # which shellcheck stops tracing once the script ends in `exit "$status"` (the
 # status passthrough, which is not negotiable). Invoked indirectly is the case
 # SC2329's own documentation says to silence.
+#
+# SC2317 ("command appears to be unreachable") is the SAME false positive under
+# an older shellcheck, which reports this shape under that code instead. Both
+# are silenced together because silencing only one is how it got past three
+# separate reviewers: everyone ran 0.11.0 locally, CI ran the runner image's
+# unpinned build, and `shellcheck rc=0` was true of a different tool than the
+# one gating the build. CI now pins the version -- see .github/workflows.
 on_signal() { # signal-name signal-number
   [ -n "$CHILD" ] && kill -"$1" "$CHILD" 2>/dev/null
   release

@@ -98,7 +98,13 @@ CALLER="$(caller)"
 BEFORE="$(windows)"
 SOCK="${TMPDIR:-/tmp}/wt-tmux-$$.sock"; rm -f "$SOCK"
 handle=""
-# shellcheck disable=SC2329  # invoked by the EXIT trap below
+# Invoked by the EXIT trap below. Static analysis cannot see through a trap, and
+# the complaint arrives under a DIFFERENT CODE depending on the version: 0.11.0
+# files it as SC2329, older builds as SC2317 ("unreachable"). Both are silenced,
+# because silencing one is how this passed locally and reddened CI. No comment
+# line here may begin with the word shellcheck -- 0.10.0 reads such a line as a
+# malformed directive and fails the file outright, which 0.11.0 does not.
+# shellcheck disable=SC2329,SC2317
 cleanup() {
   [ -n "$handle" ] && "$TM" kill-window -t "$handle" 2>/dev/null
   rm -f "$SOCK"

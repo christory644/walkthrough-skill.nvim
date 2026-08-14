@@ -35,8 +35,31 @@ jobs:
       - uses: actions/checkout@v4
       - uses: rhysd/action-setup-vim@v1
         with: { neovim: true, version: stable }
+      # Pin shellcheck, and print the version it is actually using.
+      #
+      # This step exists because of a real failure, not tidiness. The runner
+      # image ships an UNPINNED shellcheck, and the one it shipped reported
+      # trap-invoked cleanup functions as SC2317 ("command appears to be
+      # unreachable") where 0.11.0 reports the same false positive as SC2329.
+      # Three separate sessions each verified `shellcheck rc=0` completely
+      # honestly -- against a different tool than the one gating the build --
+      # and main was red for four pushes.
+      #
+      # An unpinned linter is not a gate, it is a moving target that happens to
+      # agree with you most days. Contributors should run this same version;
+      # docs/parallel-work.md names it.
+      - name: pin shellcheck
+        run: |
+          set -euo pipefail
+          v=v0.11.0
+          curl -fsSL "https://github.com/koalaman/shellcheck/releases/download/$v/shellcheck-$v.linux.x86_64.tar.xz" \
+            | tar -xJ
+          sudo install -m 0755 "shellcheck-$v/shellcheck" /usr/local/bin/shellcheck
+          rm -rf "shellcheck-$v"
       - name: shellcheck
-        run: shellcheck bin/walkthrough backends/*.sh install.sh tests/*.sh scripts/with-lock
+        run: |
+          shellcheck --version
+          shellcheck bin/walkthrough backends/*.sh install.sh tests/*.sh scripts/with-lock
       - name: backend detection
         run: ./tests/test_backend_detect.sh
       - name: cli
