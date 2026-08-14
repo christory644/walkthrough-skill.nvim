@@ -191,8 +191,14 @@ sentences and both are happy.
 
 ## Further reading
 
-- [`docs/known-issues.md`](docs/known-issues.md) — the corners where this is
-  quietly less helpful than it looks, each with when you would hit it.
+- [Known issues](https://github.com/christory644/walkthrough-skill.nvim/issues?q=is%3Aissue+is%3Aopen+label%3Abug) —
+  the corners where this is quietly less helpful than it looks, each with when
+  you would hit it and why it was left. The ones labelled
+  [`deferred-by-design`](https://github.com/christory644/walkthrough-skill.nvim/issues?q=is%3Aissue+is%3Aopen+label%3Adeferred-by-design)
+  are deliberate: the reasoning for keeping the current behaviour is in the issue.
+- [Good first issues](https://github.com/christory644/walkthrough-skill.nvim/labels/good%20first%20issue) —
+  including a tmux backend, which is one file and the highest-leverage thing
+  anyone could add.
 - [`docs/implementation-notes.md`](docs/implementation-notes.md) — where the
   shipped code diverges from the plan and spec in `docs/`, and
   why. Read it before trusting either of those documents.
