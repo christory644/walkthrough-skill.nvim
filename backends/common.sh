@@ -112,8 +112,39 @@ wt_wait_for_socket() {
 # encoding.
 wt_b64() { printf %s "$1" | base64 | tr -d '\n'; }
 
+# Quote one argument for a shell we do not get to choose.
+#
+# The string this builds is TYPED INTO THE USER'S LOGIN SHELL (cmux `send`) or
+# handed to whatever `sh` the multiplexer runs it with. `printf %q` was the
+# obvious tool and the wrong one: it emits bash/zsh `$'...'` for a value
+# containing a control character, and measured against real parsers that is
+#
+#   sh/bash/zsh/ksh   $'nl\nb.txt'  -> correct
+#   dash              $'nl\nb.txt'  -> opens a file literally named $nl\nb.txt
+#   csh/tcsh          $'nl\nb.txt'  -> "Illegal variable name."
+#
+# dash is the one that matters: it does not fail, it silently opens a
+# different file. A wrong walkthrough is worse than no walkthrough.
+#
+# POSIX single-quote armour instead: everything between '...' is literal in
+# every one of those shells, and an embedded quote closes the run, contributes
+# an escaped quote, and reopens. csh and tcsh accept that form too, because
+# their backslash escaping outside quotes agrees with POSIX here.
+#
+# Residual, stated rather than hidden: csh and tcsh cannot carry a literal
+# NEWLINE in an argument at all, so such a filename fails loudly there. Loud
+# is the point -- that is the case dash used to get wrong in silence.
+wt_shquote() {
+  _wt_rest="$1"; _wt_acc=''
+  while [ "${_wt_rest#*\'}" != "$_wt_rest" ]; do
+    _wt_acc="$_wt_acc${_wt_rest%%\'*}'\\''"
+    _wt_rest="${_wt_rest#*\'}"
+  done
+  printf "'%s'" "$_wt_acc$_wt_rest"
+}
+
 wt_nvim_cmd() { # $1=workspace root, $2=socket, rest=files
-  cwd="$1"; sock="$2"; shift 2
+  _wt_cwd="$1"; _wt_sock="$2"; shift 2
   # --cmd pins the player's working directory to the workspace root the tour's
   # `file` entries are relative to (see wt_workspace_root in bin/walkthrough).
   # The terminal the backend spawns starts in whatever directory it likes, so
@@ -129,7 +160,15 @@ wt_nvim_cmd() { # $1=workspace root, $2=socket, rest=files
   #
   # SessionDisableAutoSave: the player is a throwaway editor and must not let a
   # session manager persist its state over the user's own sessions.
-  printf "nvim --cmd \"lua vim.fn.chdir(vim.base64.decode('%s'))\" -c 'silent! SessionDisableAutoSave' --listen %s" \
-    "$(wt_b64 "$cwd")" "$sock"
-  for f in "$@"; do printf " %s" "$(printf %q "$f")"; done
+  #
+  # Every argument goes through wt_shquote -- the --cmd chunk, the socket and
+  # each file alike. One quoting rule for the whole line, rather than a
+  # hand-placed double quote here, a hand-placed single quote there and an
+  # unquoted socket path in the middle: the socket sits under $TMPDIR, which
+  # is a directory the user names and may contain a space.
+  printf 'nvim --cmd %s -c %s --listen %s' \
+    "$(wt_shquote "lua vim.fn.chdir(vim.base64.decode('$(wt_b64 "$_wt_cwd")'))")" \
+    "$(wt_shquote 'silent! SessionDisableAutoSave')" \
+    "$(wt_shquote "$_wt_sock")"
+  for _wt_f in "$@"; do printf ' %s' "$(wt_shquote "$_wt_f")"; done
 }
