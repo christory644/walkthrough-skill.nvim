@@ -172,6 +172,68 @@ check "C-3 a planted state file is refused, not executed" "0" "$c3b"
 rm -f "$STATE_FILE"
 
 # ---------------------------------------------------------------------------
+# C-3b — reading the state checks the DIRECTORY, not only the file (#15)
+#
+# `state_dir_ready` verified `-O "$STATE_DIR"` when WRITING; `state_read`
+# verified only `-O "$STATE"`. A directory someone else owns cannot produce a
+# state file we own, but it can delete, rename or symlink around one — so on a
+# shared /tmp with no XDG_RUNTIME_DIR, another local user plants
+# $TMPDIR/walkthrough-$USER as a link to a directory of their own and every
+# read follows it.
+#
+# The exposure is not execution: the file is parsed, never sourced, and every
+# value is base64 and character-checked before decoding. It is that `close`
+# unlinks the socket path its state file names, which is the consequence
+# asserted here — a file outside the fake state directory entirely, which the
+# CLI must not delete on an attacker's say-so.
+#
+# Exit status alone cannot see this: `close` exits non-zero on the planted
+# state either way (the handle is not a UUID, so the cmux backend refuses it).
+# What discriminates is WHY it refused and what survived, so both are asserted.
+# ---------------------------------------------------------------------------
+c3b_root="$WORK/c3b"
+mkdir -p "$c3b_root/xdg" "$c3b_root/attacker"
+printf 'not really a socket\n' > "$c3b_root/victim.sock"
+ln -s "$c3b_root/attacker" "$c3b_root/xdg/walkthrough-${USER:-x}"
+# Written by hand, because the CLI's own writer already refuses this directory
+# — which is the asymmetry the issue is about.
+printf 'backend=%s\nhandle=%s\nsocket=%s\ntour=%s\n' \
+  "$(printf %s cmux | base64 | tr -d '\n')" \
+  "$(printf %s planted-handle | base64 | tr -d '\n')" \
+  "$(printf %s "$c3b_root/victim.sock" | base64 | tr -d '\n')" \
+  "$(printf %s "$WORK/t.tour" | base64 | tr -d '\n')" \
+  > "$c3b_root/attacker/state"
+
+c3bout="$(XDG_RUNTIME_DIR="$c3b_root/xdg" \
+  env -u CMUX_SURFACE_ID -u TMUX -u WALKTHROUGH_BACKEND "$WT" close 2>&1)"
+check "C-3b close refuses a symlinked state directory" "1" "$?"
+printf %s "$c3bout" | grep -q 'state dir is a symlink'
+check "C-3b ...saying the directory is the problem, not the file" "0" "$?"
+[ -e "$c3b_root/victim.sock" ] && c3bv=0 || c3bv=1
+check "C-3b ...and the file the planted state named was not unlinked" "0" "$c3bv"
+
+# The check belongs to state_read, not to `close`: every command that reads the
+# state has to make it. `step` is the one that runs most often.
+c3bstep="$(XDG_RUNTIME_DIR="$c3b_root/xdg" \
+  env -u CMUX_SURFACE_ID -u TMUX -u WALKTHROUGH_BACKEND "$WT" step +1 2>&1)"
+check "C-3b step refuses it too" "1" "$?"
+printf %s "$c3bstep" | grep -q 'state dir is a symlink'
+check "C-3b ...for the same reason" "0" "$?"
+
+# ...and the ordinary case is untouched: a state directory we made, in a
+# directory we own, still reads back. Without this the checks above would be
+# satisfied by a state_read that refused everything.
+c3bok="$( cd "$REPO" && bash -c '
+    set -uo pipefail
+    source ./bin/walkthrough --help >/dev/null 2>&1
+    state_write "cmux" "H" "/nope.sock" "/tmp/t.tour"
+    state_read
+    printf %s "$ST_backend/$ST_handle"
+  ' _ )"
+check "C-3b a state directory we own still reads back" "cmux/H" "$c3bok"
+rm -f "$STATE_FILE"
+
+# ---------------------------------------------------------------------------
 # C-4 — nothing but base64 crosses the --remote-expr boundary
 #
 # The five values used to be pasted into a vimscript single-quoted list inside

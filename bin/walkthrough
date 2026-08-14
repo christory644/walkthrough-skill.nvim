@@ -157,6 +157,22 @@ ST_backend=""; ST_handle=""; ST_socket=""; ST_tour=""
 state_read() {
   local line key val
   ST_backend=""; ST_handle=""; ST_socket=""; ST_tour=""
+  # The DIRECTORY, before the file (#15). Writing checked it and reading did
+  # not, and the two questions are not the same one asked twice: a directory
+  # someone else owns — or a symlink pointing at one — cannot produce a state
+  # file we own, but it can delete, rename or symlink around one, so `-O
+  # "$STATE"` alone says only that the file we happened to open is ours. Where
+  # this bites is a shared /tmp with no XDG_RUNTIME_DIR: another local user
+  # plants $TMPDIR/walkthrough-$USER as a link to a directory of their own, and
+  # every read here trusts what is inside it. Not execution — the file is
+  # parsed, never sourced, and every value is base64 and character-checked
+  # before decoding — but `close` unlinks the socket path its state names, so a
+  # planted state file is an arbitrary file the victim deletes for them.
+  #
+  # It is the same check `state_write` makes, deliberately: one implementation,
+  # so read and write cannot come to disagree about what a safe state
+  # directory is.
+  state_dir_ready
   if [ ! -O "$STATE" ]; then die "state file is not owned by you, refusing: $STATE"; fi
   while IFS= read -r line || [ -n "$line" ]; do
     key="${line%%=*}"; val="${line#*=}"
