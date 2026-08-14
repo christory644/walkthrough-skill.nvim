@@ -2,13 +2,36 @@ local T = dofile("tests/harness.lua")
 T.load_plugin()
 local wt = require("walkthrough")
 
-vim.fn.mkdir(".tmp", "p")
-vim.fn.writefile({ "one", "two", "three", "four", "five" }, ".tmp/a.txt")
+-- Fixtures live in a private temp directory, not in `.tmp/` under the
+-- checkout. Two concurrent runs of this suite -- two sessions working the
+-- repository at once, which is now routine -- shared that one path: each
+-- rewrote a.txt under the other mid-assertion, and whichever finished first
+-- deleted it out from under the other. An aborted run also left it behind.
+--
+-- `fs_realpath`, not `os_tmpdir()` alone: a temp dir on macOS is reached
+-- through /var -> /private/var, and a step matches a buffer by plain string
+-- equality on `abspath` (nav.lua, render.apply). A fixture named through the
+-- unresolved hop matches NO buffer, so the renderer draws nothing and every
+-- assertion below passes by measuring an empty editor. tests/test_fuzz.lua
+-- carries the same guard for the same reason.
+local uv = vim.uv or vim.loop
+local scratch = assert(uv.fs_mkdtemp((uv.os_tmpdir() or "/tmp") .. "/wtreload.XXXXXX"))
+scratch = uv.fs_realpath(scratch) or scratch
+local A = scratch .. "/a.txt"
+local GONE = scratch .. "/no-such-file.txt"
+
+-- The assertion that keeps the above true: a fixture path that has drifted back
+-- inside the checkout is what this whole preamble exists to prevent, and
+-- nothing else here would notice.
+T.ok(scratch:sub(1, #vim.fn.getcwd()) ~= vim.fn.getcwd(),
+  "fixtures live outside the checkout, so two concurrent runs cannot collide")
+
+vim.fn.writefile({ "one", "two", "three", "four", "five" }, A)
 
 local function tour_with(offset)
   return { title = "t", steps = {
-    { title = "s1", file = ".tmp/a.txt", line = 2 + offset, description = "one" },
-    { title = "s2", file = ".tmp/a.txt", line = 5 + offset, description = "two" },
+    { title = "s1", file = A, line = 2 + offset, description = "one" },
+    { title = "s2", file = A, line = 5 + offset, description = "two" },
   } }
 end
 
@@ -21,8 +44,8 @@ end
 local function reload_tour(offset)
   return { title = "t", steps = {
     { title = "s0", description = "zero" },
-    { title = "s1", file = ".tmp/a.txt", line = 2 + offset, description = "one" },
-    { title = "s2", file = ".tmp/a.txt", line = 5 + offset, description = "two" },
+    { title = "s1", file = A, line = 2 + offset, description = "one" },
+    { title = "s2", file = A, line = 5 + offset, description = "two" },
   } }
 end
 
@@ -31,7 +54,7 @@ wt.step(1)
 T.eq(wt.state().id, "s2", "on s2 before the edit")
 
 -- a line is inserted at the top: every subsequent line number shifts
-vim.fn.writefile({ "NEW", "one", "two", "three", "four", "five" }, ".tmp/a.txt")
+vim.fn.writefile({ "NEW", "one", "two", "three", "four", "five" }, A)
 wt.reload(reload_tour(1))
 
 T.eq(wt.state().id, "s2", "position restored BY ID, not index or line")
@@ -50,9 +73,9 @@ T.eq(virt, 2, "no duplicated annotations after reload")
 -- can mask a broken `tour.resolve` pattern branch: a freshly loaded buffer
 -- starts at line 1 unless `resolve` genuinely finds the pattern.
 wt.close()
-vim.cmd("bwipeout! " .. vim.fn.bufadd(vim.fn.fnamemodify(".tmp/a.txt", ":p")))
+vim.cmd("bwipeout! " .. vim.fn.bufadd(A))
 wt.open({ title = "t", steps = {
-  { title = "p", file = ".tmp/a.txt", pattern = "^five$", description = "by pattern" } } })
+  { title = "p", file = A, pattern = "^five$", description = "by pattern" } } })
 T.eq(vim.api.nvim_win_get_cursor(0)[1], 6, "pattern step found the shifted line unaided")
 
 wt.close()
@@ -66,8 +89,8 @@ wt.close()
 -- back out through the CLI. Recovery needed a shell command the reader had no
 -- way to know about.
 wt.open({ title = "before reload", steps = {
-  { title = "s1", file = ".tmp/a.txt", line = 2, description = "one" },
-  { title = "s2", file = ".tmp/a.txt", line = 3, description = "two" },
+  { title = "s1", file = A, line = 2, description = "one" },
+  { title = "s2", file = A, line = 3, description = "two" },
 } })
 wt.goto_step(2)
 local live_buf = vim.api.nvim_get_current_buf()
@@ -93,18 +116,18 @@ end
 reload_refused({ steps = {} }, "a tour with no title")
 -- a tour that parses but has nothing left to play: caught after, and undone
 reload_refused({ title = "nothing plays", steps = {
-  { title = "gone", file = ".tmp/no-such-file.txt", line = 1, description = "d" } } },
+  { title = "gone", file = GONE, line = 1, description = "d" } } },
   "a tour whose every step is unplayable")
 
 T.ok(vim.api.nvim_buf_is_valid(live_buf), "the reader's buffer survived both refusals")
 
 -- ...and a reload that CAN play still replaces the tour, from that same state.
 wt.reload({ title = "after reload", steps = {
-  { title = "s2", file = ".tmp/a.txt", line = 4, description = "two" },
+  { title = "s2", file = A, line = 4, description = "two" },
 } })
 T.eq(wt.state().title, "after reload", "a good reload still replaces the tour")
 T.eq(wt.state().id, "s2", "...restoring position by id")
 
 wt.close()
-vim.fn.delete(".tmp", "rf")
+vim.fn.delete(scratch, "rf")
 T.done()
