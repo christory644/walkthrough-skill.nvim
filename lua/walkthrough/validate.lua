@@ -72,10 +72,59 @@ end
 -- relative when it is below them, absolute when it is not. `base` is the CLI's
 -- invocation directory; with none given (a direct call) the tour's own
 -- spelling is kept.
+--
+-- Two paths that name the same place can be spelled differently, and comparing
+-- the spellings answers the wrong question. We run from the workspace root,
+-- where nvim's cwd is the REAL directory (`/private/var/...`), while `base`
+-- arrives as the shell's `$PWD`, which keeps whatever symlink the caller walked
+-- through (`/var/...`, `/tmp/...`). Both name one directory; a prefix test on
+-- the text says they are unrelated, and every path in the report came out
+-- absolute — correct, and useless to read, on a clone that had done nothing
+-- wrong (#10). macOS `$TMPDIR` and `/tmp` are both symlinks, so this is the
+-- ordinary case, not an exotic one.
+--
+-- The literal comparison is tried FIRST and unchanged, so nothing that already
+-- printed a relative path can start printing something else. The real-location
+-- comparison is a second chance for the paths that would otherwise fall through
+-- to absolute — in particular it does not resolve a path that already matches,
+-- so a symlinked file or directory inside the workspace is still named where
+-- the reader can see it rather than at its target.
+local uv = vim.uv or vim.loop
+
+-- The DIRECTORY is resolved and the name is left alone, deliberately. The hop
+-- we are correcting for is a directory one -- `/tmp` -> `/private/tmp`, and
+-- every parent above it -- so resolving the parent chain is enough to make the
+-- two spellings comparable. Resolving the file as well would rewrite a step
+-- whose `file` is itself a symlink into wherever it points: the tour says
+-- `src/linked.txt`, the report would say `/elsewhere/real.txt`, and the reader
+-- would be handed a path that appears nowhere in the document they are fixing.
+--
+-- It also means a file that does not EXIST still resolves, which matters --
+-- "file not found" is half of what this report says, and that message names a
+-- path too.
+local function real_file(p)
+  local dir = uv.fs_realpath(vim.fs.dirname(p))
+  return dir and (dir .. "/" .. vim.fs.basename(p)) or nil
+end
+
+local base_real = (type(base) == "string" and base ~= "")
+  and uv.fs_realpath(base) or nil
+
+local function relative_to(dir, p)
+  local prefix = dir:sub(-1) == "/" and dir or (dir .. "/")
+  if p:sub(1, #prefix) == prefix then return p:sub(#prefix + 1) end
+  return nil
+end
+
 local function shown(abs, rel)
   if type(base) ~= "string" or base == "" then return rel end
-  local prefix = base:sub(-1) == "/" and base or (base .. "/")
-  if abs:sub(1, #prefix) == prefix then return abs:sub(#prefix + 1) end
+  local literal = relative_to(base, abs)
+  if literal then return literal end
+  if base_real then
+    local abs_real = real_file(abs)
+    local resolved = abs_real and relative_to(base_real, abs_real)
+    if resolved then return resolved end
+  end
   return abs
 end
 

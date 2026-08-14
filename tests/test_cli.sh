@@ -389,6 +389,63 @@ printf %s "$v2none" | grep -q 'nope'
 check "V-2 ...and names the pattern that no longer matches" "0" "$?"
 
 # ---------------------------------------------------------------------------
+# V-2s — ...and it stays relative when the caller stands behind a symlink
+#
+# The report is relative so it reads by eye and pipes into `nvim -q -`. It is
+# made relative by comparing the file against the CLI's invocation directory —
+# and those two arrive spelled differently whenever a symlink is involved. We
+# run FROM the workspace root, where nvim's cwd is the real directory
+# (`/private/var/...`); `$PWD` keeps the hop the caller walked through
+# (`/var/...`, `/tmp/...`). One directory, two spellings, and a text prefix
+# test says they are unrelated — so every path came out absolute.
+#
+# Nothing about the tour was wrong, which is what made this expensive: on macOS
+# both `/tmp` and `$TMPDIR` are symlinks, so a contributor who cloned into one
+# ran a clean tree and watched V-2 above go red on code they had never touched.
+#
+# Reproduced HERE rather than by hoping the checkout is symlinked: the link is
+# built, so this fails on any machine when the fix is reverted, including a
+# checkout sitting on a perfectly literal path.
+# ---------------------------------------------------------------------------
+mkdir -p "$WORK/sl/real/src"
+printf 'alpha\nbeta\ngamma\n' > "$WORK/sl/real/src/app.txt"
+ln -s "$WORK/sl/real" "$WORK/sl/link"
+printf '%s\n' '{ "title": "behind a symlink", "steps": [
+  { "title": "p", "file": "src/app.txt", "pattern": "^beta$", "description": "d" } ] }' \
+  > "$WORK/sl/real/sym.tour"
+slout="$( cd "$WORK/sl/link" && "$WT" validate sym.tour 2>&1 )"
+check "V-2s a tour under a symlinked directory still validates" "0" "$?"
+printf %s "$slout" | grep -q '^src/app.txt:2:'
+check "V-2s ...and the report is relative to where the caller stands" "0" "$?"
+printf %s "$slout" | grep -q '^/'
+check "V-2s ...not an absolute path the reader has to re-read" "1" "$?"
+
+# the same for a step whose file is GONE: that message names a path too, and it
+# is resolved before anyone knows the file is missing.
+printf '%s\n' '{ "title": "behind a symlink, rotted", "steps": [
+  { "title": "g", "file": "src/gone.txt", "line": 1, "description": "d" } ] }' \
+  > "$WORK/sl/real/symrot.tour"
+slrot="$( cd "$WORK/sl/link" && "$WT" validate symrot.tour 2>&1 )"
+check "V-2s a missing file behind a symlink still fails" "1" "$?"
+printf %s "$slrot" | grep -q 'file not found: src/gone.txt'
+check "V-2s ...naming it relative to the caller as well" "0" "$?"
+
+# ...and a file that is itself a symlink pointing OUT of the workspace is still
+# named where the reader can see it, not at its target. The realpath comparison
+# is a second chance for paths that would otherwise print absolute; it must not
+# reach the ones that already resolve.
+mkdir -p "$WORK/sl/outside"
+printf 'alpha\nbeta\ngamma\n' > "$WORK/sl/outside/elsewhere.txt"
+ln -s "$WORK/sl/outside/elsewhere.txt" "$WORK/sl/real/src/linked.txt"
+printf '%s\n' '{ "title": "a symlinked file", "steps": [
+  { "title": "p", "file": "src/linked.txt", "pattern": "^beta$", "description": "d" } ] }' \
+  > "$WORK/sl/real/symfile.tour"
+slfile="$( cd "$WORK/sl/link" && "$WT" validate symfile.tour 2>&1 )"
+check "V-2s a step whose file is a symlink out of the tree still validates" "0" "$?"
+printf %s "$slfile" | grep -q '^src/linked.txt:2:'
+check "V-2s ...and is named as the tour spells it, not at its target" "0" "$?"
+
+# ---------------------------------------------------------------------------
 # V-3 — validate checks `line` steps too
 #
 # A step carrying a `line` used to be exempt from every check but its file's
