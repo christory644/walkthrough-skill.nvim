@@ -82,10 +82,30 @@ wt_require_backend() {
     return 1
   fi
   if [ ! -f "$_wt_r/backends/$_wt_name.sh" ]; then
+    # This first line is quoted verbatim in README.md and SKILL.md. Keep it
+    # byte-identical, including for the `none` case below.
     echo "walkthrough: no backend for '$_wt_name'." >&2
     # paste, not `tr '\n' ' '`, which leaves a trailing space on a line that
     # README and SKILL.md quote verbatim.
-    echo "  available: $(wt_list_backends "$_wt_r" | paste -sd' ' -)" >&2
+    _wt_have="$(wt_list_backends "$_wt_r" | paste -sd' ' -)"
+
+    # `none` is not the name of a terminal. It is the sentinel wt_detect_backend
+    # returns when it recognised nothing, so the generic advice below -- "add
+    # backends/$name.sh" -- came out as "add backends/none.sh", which is not a
+    # file anyone should write and not a thing that would ever be loaded. Two
+    # different situations were sharing one message: "your terminal has no
+    # backend yet" and "no terminal was detected at all". The second is far
+    # more common and has a completely different fix.
+    if [ "$_wt_name" = "none" ]; then
+      echo "  No terminal multiplexer was detected: neither \$CMUX_SURFACE_ID" >&2
+      echo "  (cmux) nor \$TMUX (tmux) is set, so there is no surface to open a" >&2
+      echo "  tour in. Backends available here: $_wt_have." >&2
+      echo "  If you are inside one of those, run this from a shell inside it." >&2
+      echo "  Otherwise set WALKTHROUGH_BACKEND=<name> to choose one yourself." >&2
+      return 1
+    fi
+
+    echo "  available: $_wt_have" >&2
     echo "  Adding one is a single file: backends/$_wt_name.sh, defining" >&2
     echo "  backend_open and backend_close. Override detection with" >&2
     echo "  WALKTHROUGH_BACKEND." >&2

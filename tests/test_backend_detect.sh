@@ -36,6 +36,41 @@ check "unimplemented backend errors" "1" "$?"
 # which is exactly the bug #18 produced.
 ( . ./backends/common.sh; wt_require_backend cmux ) >/dev/null 2>&1
 check "implemented backend accepted" "0" "$?"
+( . ./backends/common.sh; wt_require_backend tmux ) >/dev/null 2>&1
+check "tmux is implemented now, and accepted" "0" "$?"
+
+# ---------------------------------------------------------------------------
+# The refusal messages, which are somebody else's fixture.
+#
+# README.md and skills/walkthrough/SKILL.md quote the FIRST line verbatim, so
+# it is load-bearing text and not prose to tidy. The body below it is ours.
+# ---------------------------------------------------------------------------
+none_msg="$( . ./backends/common.sh; wt_require_backend none 2>&1 >/dev/null )"
+first_line="${none_msg%%$'\n'*}"
+check "the quoted first line is byte-identical" \
+  "walkthrough: no backend for 'none'." "$first_line"
+
+# `none` is the sentinel wt_detect_backend returns when it recognised nothing
+# -- it is not the name of a terminal. The generic advice used to interpolate
+# it, telling the reader to write `backends/none.sh`: a file that would never
+# be loaded, as the answer to a problem whose real fix is "you are not inside
+# a multiplexer". Two situations were sharing one message.
+case "$none_msg" in
+  *"backends/none.sh"*) echo "  FAIL: the 'none' refusal still advises writing backends/none.sh"; fail=1 ;;
+  *) echo "  ok: the 'none' refusal does not advise writing backends/none.sh" ;;
+esac
+# shellcheck disable=SC2016  # matching the LITERAL text "$TMUX" in the message
+case "$none_msg" in
+  *'$TMUX'*) echo "  ok: the 'none' refusal names the variables detection looks at" ;;
+  *) echo "  FAIL: the 'none' refusal does not say what was looked for"; fail=1 ;;
+esac
+# A genuinely unimplemented, genuinely named terminal still gets the advice
+# that fits IT -- the two branches must not collapse into one.
+kitty_msg="$( . ./backends/common.sh; wt_require_backend kitty 2>&1 >/dev/null )"
+case "$kitty_msg" in
+  *"backends/kitty.sh"*) echo "  ok: a named terminal is still told which file to add" ;;
+  *) echo "  FAIL: a named terminal lost its add-a-backend advice"; fail=1 ;;
+esac
 
 # ---------------------------------------------------------------------------
 # Sourcing from a strict POSIX shell (#18)
