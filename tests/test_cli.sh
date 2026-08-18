@@ -249,7 +249,7 @@ rm -f "$STATE_FILE"
 # — sat behind a 0700, symlink-refused, ownership-checked directory. The weaker
 # link defined the security of the pair.
 # ---------------------------------------------------------------------------
-sock_line="$(grep -n 'sock=' "$REPO/bin/walkthrough" | grep -v '^ *#' | head -1)"
+sock_line="$(grep -v '^ *#' "$REPO/bin/walkthrough" | grep -n 'sock=' | head -1)"
 # shellcheck disable=SC2016  # matching a literal '$STATE_DIR' substring in the source, not expanding it
 case "$sock_line" in
   *'$STATE_DIR'*) check "socket path is built from STATE_DIR" "0" "0" ;;
