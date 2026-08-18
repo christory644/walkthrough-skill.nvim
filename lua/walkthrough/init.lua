@@ -41,6 +41,9 @@ local function remember(b) state.touched[b] = true end
 -- own `path` must not be believed.
 local function dialog_ctx()
   return {
+    -- The live keys table, so the dialog's own buffer-local binding
+    -- (keys.dialog_close) is whatever setup{} last said it was.
+    keys = config.keys,
     fifo = vim.env.WALKTHROUGH_DIALOG,
     tour = state.path or "",
     step_id = state.tour and tour_mod.step_id(state.tour, state.index) or "",
@@ -200,6 +203,7 @@ function M.open(path_or_tour)
   -- first jump (its callback returns early while inactive), which is exactly
   -- what we want: goto_index draws and parks that buffer itself, and the keys
   -- for it are attached below.
+  local landed
   local ok, err = pcall(function()
     -- The drop hook is not optional here either. Building the quickfix list is
     -- the first thing that hands a step's own fields to vim, so it is the first
@@ -214,7 +218,7 @@ function M.open(path_or_tour)
     -- The real state table, not a copy: nav discovers unresolvable steps
     -- lazily, as it loads their buffers, and a step it drops has to reach
     -- state.skipped to be reported below.
-    state.index = nav.goto_index(state, first)
+    state.index, landed = nav.goto_index(state, first)
   end)
   if not ok then
     -- Half a walkthrough is worse than none: the caller gets the failure, the
@@ -232,8 +236,10 @@ function M.open(path_or_tour)
   end
 
   state.active = true
-  local buf = vim.api.nvim_get_current_buf()
-  attach_keys(buf)
+  -- The buffer nav actually drew into, not whatever is current: they are the
+  -- same window here, but asking nav is what keeps them the same after any
+  -- future change to where a step is drawn.
+  attach_keys(landed or vim.api.nvim_get_current_buf())
 
   if #skipped > 0 then
     vim.api.nvim_echo({ { string.format(
@@ -253,9 +259,14 @@ function M.goto_step(n)
   if not state.active then error("no walkthrough is open: nothing to step", 0) end
   -- The real state table, so a step nav finds unresolvable is recorded in
   -- state.skipped and surfaces in state() rather than vanishing.
-  state.index = nav.goto_index(state, n)
-  local buf = vim.api.nvim_get_current_buf()
-  attach_keys(buf)
+  local landed
+  state.index, landed = nav.goto_index(state, n)
+  -- The buffer the step was drawn into, NOT the current one. A step driven from
+  -- the CLI while the reader is in the dialog leaves their focus in the dialog,
+  -- and attaching the walkthrough's keymaps to the prompt buffer would also put
+  -- it in state.touched -- which is exactly where the dialog must never be, or
+  -- the next reload runs `silent! edit!` over the transcript.
+  if landed then attach_keys(landed) end
 end
 
 function M.step(delta) M.goto_step(state.index + delta) end
@@ -321,8 +332,11 @@ function M.reload(path_or_tour)
   -- state.touched: that reset discards the only record that these buffers
   -- were ever part of a walkthrough, so any that drop out of the new tour
   -- would otherwise keep their keymaps for the life of the process.
-  -- Keep the dialog. See teardown.
-  local dialog_was_open = dialog.is_open()
+  -- Keep the dialog. See teardown. The BUFFER is the conversation, so a dialog
+  -- the reader has dismissed still gets told the tour changed -- reopening it
+  -- after a reload must not show questions asked about the old tour with nothing
+  -- to say they were.
+  local dialog_was_open = dialog.has_buffer()
   for b in pairs(state.touched) do
     if vim.api.nvim_buf_is_valid(b) then
       render.clear(b)

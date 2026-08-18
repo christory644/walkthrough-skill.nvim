@@ -196,6 +196,48 @@ function M.demote(state, t, i, why)
     i, tour.step_id(t, i), why), "WarningMsg" } }, true, {})
 end
 
+-- The window a step is drawn into, which is NOT "whatever is current".
+--
+-- `vim.cmd("buffer ...")` retargets the current window, and `dialog.open`
+-- leaves the DIALOG's window current and in insert mode -- which is exactly
+-- where the reader sits while an answer is being composed, and exactly when the
+-- answering agent runs `walkthrough step +1` (SKILL.md § 8 tells it to). The
+-- step was drawn straight over the transcript: the dialog's window showed a code
+-- file, the transcript buffer was orphaned in no window, and the reader had no
+-- way to get the dialog back.
+--
+-- So the code goes to a window that is not the dialog's, and it gets there
+-- through `nvim_win_set_buf` rather than through `:buffer`, so the reader's
+-- focus never moves at all: a step driven from the agent's side updates the code
+-- window without taking the cursor out of the line they are typing in.
+local function code_window()
+  local ok, dialog = pcall(require, "walkthrough.dialog")
+  local dwin = (ok and dialog.is_open()) and dialog.winid() or nil
+  local cur = vim.api.nvim_get_current_win()
+  if cur ~= dwin then return cur end
+  for _, w in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+    if w ~= dwin then return w end
+  end
+  -- The dialog is the only window left (`:only` from inside it). Make somewhere
+  -- for the code to go rather than taking the dialog's window by force.
+  local made
+  vim.api.nvim_win_call(dwin, function()
+    vim.cmd("aboveleft split")
+    made = vim.api.nvim_get_current_win()
+  end)
+  -- 'winbar' is window-local and a `:split` copies it, so the new code window
+  -- would otherwise wear the dialog's "ask · step ..." bar. Back to whatever the
+  -- reader's own global setting is, which is what an ordinary window shows.
+  vim.wo[made].winbar = vim.go.winbar
+  return made
+end
+
+-- Returns the index landed on, and the buffer it was drawn into. Callers need
+-- the second value because the reader's focus may be somewhere else entirely
+-- (the dialog): `nvim_get_current_buf()` after this call is not necessarily the
+-- step's buffer, and attaching the walkthrough's keymaps to the dialog's prompt
+-- buffer would enrol it in `state.touched`, which is the one place the dialog
+-- must never appear.
 function M.goto_index(state, i)
   local t = state.tour
   i = math.max(1, math.min(#t.steps, i))
@@ -218,8 +260,9 @@ function M.goto_index(state, i)
     elseif not line then
       M.demote(state, t, target, unresolved(t, target, bufnr))
     else
-      if vim.api.nvim_get_current_buf() ~= bufnr then
-        vim.cmd("buffer " .. bufnr)
+      local win = code_window()
+      if vim.api.nvim_win_get_buf(win) ~= bufnr then
+        vim.api.nvim_win_set_buf(win, bufnr)
       end
 
       -- Drawing this buffer touches every OTHER step in it too, any of which
@@ -237,12 +280,15 @@ function M.goto_index(state, i)
         i = target
       else
         state.index = target
-        render.park(0, bufnr, line)
+        -- The window we drew into, not window 0: the reader may be sitting in
+        -- the dialog, and parking window 0 would move the cursor of the prompt
+        -- line instead of the code.
+        render.park(win, bufnr, line)
         vim.bo[bufnr].modifiable = false
 
         vim.api.nvim_echo({ { string.format("  [%d/%d] %s", target, #t.steps,
           type(s.title) == "string" and s.title or ""), "ModeMsg" } }, false, {})
-        return target
+        return target, bufnr
       end
     end
   end

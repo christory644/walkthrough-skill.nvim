@@ -1,6 +1,7 @@
 -- The dialog surface. This file owns the split, the prompt buffer and the
 -- transcript; walkthrough.channel owns the write.
 local channel = require("walkthrough.channel")
+local keys_mod = require("walkthrough.keys")
 
 local M = {}
 
@@ -15,9 +16,29 @@ local S = { buf = nil, win = nil, ctx = nil, seq = 0 }
 
 M.HEIGHT = 12
 
+-- The transcript lives with the BUFFER; the window is only a view onto it. Ask
+-- this, not `is_open()`, before writing to the transcript: an answer that lands
+-- while the dialog is dismissed is recorded rather than dropped, and reopening
+-- brings back the same conversation instead of a blank one.
+function M.has_buffer()
+  return S.buf ~= nil and vim.api.nvim_buf_is_valid(S.buf)
+end
+
+-- S.win and S.buf being individually valid is NOT enough, and the gap was on
+-- the ordinary path. `nav.goto_index` used to retarget whatever window was
+-- CURRENT, and `M.open` leaves the dialog's window current and in insert mode --
+-- exactly where the reader sits while an answer is being composed, and exactly
+-- when the answering agent runs `walkthrough step +1` (SKILL.md § 8 tells it
+-- to). The dialog's window then showed a code file while `is_open()` still said
+-- true: `M.open` took its reopen branch and only ran `startinsert` in a
+-- nomodifiable code buffer, so the dialog never came back, and every later
+-- `append` moved the cursor of a window whose buffer no longer had those lines
+-- -- which is how `answer` and `reload` came to report failure through the CLI
+-- for work that had already succeeded. nav no longer draws into this window;
+-- this identity check is what stops that degrading silently again.
 function M.is_open()
-  return S.win ~= nil and vim.api.nvim_win_is_valid(S.win)
-    and S.buf ~= nil and vim.api.nvim_buf_is_valid(S.buf)
+  return M.has_buffer() and S.win ~= nil and vim.api.nvim_win_is_valid(S.win)
+    and vim.api.nvim_win_get_buf(S.win) == S.buf
 end
 
 function M.bufnr() return S.buf end
@@ -37,6 +58,18 @@ local function make_buffer()
   vim.bo[buf].swapfile = false
   vim.bo[buf].buflisted = false
   vim.fn.prompt_setprompt(buf, "> ")
+  -- The name is fixed so the reader can find the transcript in `:ls`, which
+  -- makes it a resource exactly one buffer can hold: nvim_buf_set_name raises
+  -- E95 when another buffer already has it. That is not hypothetical -- the
+  -- buffer is bufhidden=hide, so `:q` (or `<C-w>c`, or `:only`) leaves it alive
+  -- with the name still claimed, and the NEXT `<leader>aa` threw. M.open reuses
+  -- a surviving buffer rather than building a second one, so the only way to
+  -- reach here with the name taken is an orphan nothing points at any more:
+  -- take the name from it instead of raising.
+  local prior = vim.fn.bufnr("^walkthrough://dialog$")
+  if prior ~= -1 and prior ~= buf and vim.api.nvim_buf_is_valid(prior) then
+    pcall(vim.api.nvim_buf_delete, prior, { force = true })
+  end
   vim.api.nvim_buf_set_name(buf, "walkthrough://dialog")
 
   -- Never written to disk. The transcript holds agent-authored text, and a file
@@ -74,13 +107,26 @@ function M.open(ctx)
     vim.cmd("startinsert")
     return
   end
+  -- The buffer is resolved BEFORE the split, never after. make_buffer can raise
+  -- (it claims a fixed name), and a raise after the split left S.win pointing at
+  -- a brand-new window showing a code buffer while S.buf still named the old
+  -- transcript -- exactly the mismatched state is_open() now refuses. Nothing is
+  -- built until there is a buffer to put in it.
+  --
+  -- A surviving buffer is REUSED: `:q` on the dialog dismisses the window and
+  -- keeps the transcript, so reopening has to bring the same conversation back.
+  local buf = M.has_buffer() and S.buf or make_buffer()
   -- Bottom split, full width, inside the walkthrough's own tab (OQ-2). `botright`
   -- is what makes it span every column rather than only the current one's.
   vim.cmd(string.format("botright %dsplit", M.HEIGHT))
   S.win = vim.api.nvim_get_current_win()
-  S.buf = make_buffer()
+  S.buf = buf
   vim.api.nvim_buf_create_user_command(S.buf, "WalkthroughCancel",
     function() M.cancel_pending() end, { desc = "drop the queued question" })
+  -- Attached on every open, not once at creation, so a `setup{ keys = ... }`
+  -- between two opens is honoured. The keys come from the caller (init passes
+  -- its live config) and fall back to the defaults for a direct M.open.
+  keys_mod.attach_dialog(S.buf, (S.ctx and S.ctx.keys) or keys_mod.defaults)
   vim.api.nvim_win_set_buf(S.win, S.buf)
   vim.wo[S.win].number = false
   vim.wo[S.win].relativenumber = false
@@ -95,7 +141,11 @@ end
 -- rather than silently re-scoping: a question two lines above the notice was
 -- asked about a different version of the tour.
 function M.on_reload(ctx)
-  if not M.is_open() then return end
+  -- The notice belongs in the transcript whether or not a window is showing it:
+  -- a dismissed dialog still holds the conversation, and reopening it after a
+  -- reload must not present questions asked about the OLD tour as if they were
+  -- asked about this one.
+  if not M.has_buffer() then return end
   S.ctx = ctx
   M.append({ "— the tour was reloaded —" }, "Comment")
   M.refresh()
@@ -105,6 +155,23 @@ end
 -- of the "agent is working" state (W). M.close is defined here, above it, so
 -- this upvalue has to exist before that closure is compiled.
 local stop_working
+
+-- Dismissal, and the reason it is not M.close: the reader wants the split out of
+-- the way, not the conversation ended. The buffer, the transcript, the queued
+-- question and every nonce still outstanding survive, so `<leader>aa` reopens
+-- the same conversation. Ending it is the walkthrough's job.
+--
+-- `:q` and `<C-w>c` reach the same place by a different route -- they close the
+-- window and leave the hidden buffer behind -- which is why this is safe to
+-- offer as a binding at all: after F2 both spellings reopen.
+function M.dismiss()
+  if S.win and vim.api.nvim_win_is_valid(S.win) then
+    -- Refuses when it is the last window; the reader keeps their editor either
+    -- way, and the dialog stays reopenable.
+    pcall(vim.api.nvim_win_close, S.win, true)
+  end
+  S.win = nil
+end
 
 function M.close()
   M.cancel_pending(true)
@@ -132,7 +199,11 @@ end
 -- keeps the transcript read-only to the READER is buftype=prompt confining
 -- normal-mode edits to the last line, not this flag.
 function M.append(lines, hl)
-  if not M.is_open() then return end
+  -- The BUFFER is the transcript, so this writes whether or not a window is
+  -- currently showing it -- and it must never raise: it runs on the inbound path
+  -- (`walkthrough answer`) and on M.reload's, and a raise there reports failure
+  -- through the CLI for work that already happened.
+  if not M.has_buffer() then return end
   local last = vim.api.nvim_buf_line_count(S.buf)
   local at = math.max(last - 1, 0)
   vim.api.nvim_buf_set_lines(S.buf, at, at, false, lines)
@@ -142,7 +213,11 @@ function M.append(lines, hl)
         { line_hl_group = hl, end_row = at + i + 1 })
     end
   end
-  if vim.api.nvim_win_is_valid(S.win) then
+  -- Only ever moves the cursor of a window that is genuinely showing THIS
+  -- buffer. `nvim_win_is_valid` alone was not that question, and the window
+  -- displaying a code file with fewer lines is how this raised
+  -- "Invalid cursor line: out of range" out of `answer` and out of `reload`.
+  if M.is_open() then
     vim.api.nvim_win_set_cursor(S.win, { vim.api.nvim_buf_line_count(S.buf), 0 })
   end
 end
@@ -301,7 +376,7 @@ end
 -- auto-sent while this still matches: "does not fire if the buffer has been
 -- edited or cleared since" is the binding half of OQ-3.
 local function prompt_text()
-  if not M.is_open() then return nil end
+  if not M.has_buffer() then return nil end
   local lines = vim.api.nvim_buf_get_lines(S.buf, -2, -1, false)
   local line = lines[1] or ""
   return (line:gsub("^" .. vim.pesc(vim.fn.prompt_getprompt(S.buf)), ""))
@@ -318,7 +393,7 @@ end
 -- afterwards -- nvim only fills the last line with the bare prompt when the
 -- callback left it untouched.
 local function set_prompt_text(text)
-  if not M.is_open() then return end
+  if not M.has_buffer() then return end
   local last = vim.api.nvim_buf_line_count(S.buf)
   vim.api.nvim_buf_set_lines(S.buf, last - 1, last, false,
     { vim.fn.prompt_getprompt(S.buf) .. text })
@@ -326,7 +401,10 @@ end
 
 local function attempt()
   if not P then return end
-  if not M.is_open() then M.cancel_pending(true) return end
+  -- The buffer, not the window: a question queued for want of a reader stays
+  -- queued while the dialog is dismissed, and the prompt line it is compared
+  -- against is still there. Only the conversation ending drops it.
+  if not M.has_buffer() then M.cancel_pending(true) return end
   -- The reader changed their mind, or typed something else. Their edit wins.
   if vim.trim(prompt_text() or "") ~= P.text then
     M.append({ "walkthrough: you changed the question, so the earlier one was dropped." },
@@ -401,7 +479,7 @@ function M.send_now(text, nonce)
 end
 
 function M.clear_prompt()
-  if not M.is_open() then return end
+  if not M.has_buffer() then return end
   local last = vim.api.nvim_buf_line_count(S.buf)
   vim.api.nvim_buf_set_lines(S.buf, last - 1, last, false,
     { vim.fn.prompt_getprompt(S.buf) })

@@ -318,4 +318,168 @@ dialog.close()
 T.ok(not captured_timer:is_active(), "and M.close stops it")
 wt.close()
 
+-- ---------------------------------------------------------------------------
+-- Whole-branch review, F1 (Critical) — the walkthrough is DRIVEN while the
+-- dialog is up.
+--
+-- That is the ordinary case, not an exotic one: SKILL.md § 8 tells the
+-- answering agent to run `walkthrough step +1` as soon as it has answered, and
+-- the reader is sitting in the dialog window the whole time -- `dialog.open`
+-- leaves it current and in insert mode. Every suite before this one tested the
+-- dialog in isolation, so nothing here was covered.
+--
+-- Identical-if-broken: an assertion on `dialog.is_open()` alone PASSED on the
+-- broken build. is_open() returned true while the dialog's window displayed a
+-- code file, the transcript buffer orphaned in no window. So every assertion
+-- below is on something the reader can see or do: which buffer each window
+-- holds, that an answer lands, and that the two CLI verbs report what really
+-- happened rather than the opposite.
+-- ---------------------------------------------------------------------------
+local function transcript()
+  return table.concat(vim.api.nvim_buf_get_lines(dialog.bufnr(), 0, -1, false), "\n")
+end
+local function win_file(win)
+  return vim.api.nvim_buf_get_name(vim.api.nvim_win_get_buf(win))
+end
+
+dialog.ANSWER_TIMEOUT_MS = 300000  -- the P7 block above shortened it
+wt.open("tests/fixtures/two_files.tour")
+local f1_code_win = vim.api.nvim_get_current_win()
+wt.ask()
+local f1_buf, f1_win = dialog.bufnr(), dialog.winid()
+T.eq(vim.api.nvim_get_current_win(), f1_win,
+  "the reader is left in the dialog window, which is where a step finds them")
+
+wt.step(1)  -- exactly what `walkthrough step +1` evaluates in the player
+
+T.eq(vim.api.nvim_win_get_buf(f1_win), f1_buf,
+  "after a step the dialog window still displays the transcript")
+T.ok(dialog.is_open(), "...and the dialog is still open")
+T.ok(win_file(f1_code_win):find("beta.txt", 1, true) ~= nil,
+  "...the step was drawn in the CODE window")
+T.eq(vim.api.nvim_get_current_win(), f1_win,
+  "...and the reader's focus was not yanked out of the line they are typing in")
+T.ok(tostring(vim.wo[f1_code_win].winbar):find("ask ", 1, true) == nil,
+  "...the code window did not sprout the dialog's winbar")
+T.ok(not vim.iter(vim.api.nvim_buf_get_keymap(f1_buf, "n")):any(function(m)
+  return m.lhs == "]w"
+end), "...and the step keys were not attached to the dialog's prompt buffer")
+
+local f1_appended = pcall(dialog.append, { "agent: written after the step" }, nil)
+T.ok(f1_appended, "append does not raise after a step")
+T.ok(transcript():find("written after the step", 1, true) ~= nil, "...and lands in the transcript")
+
+-- The two CLI verbs. Both used to exit 1 with an internal "Invalid cursor line:
+-- out of range" -- `answer` for an answer the reader never saw, and `reload`
+-- AFTER the reload had fully succeeded. A status that contradicts what happened
+-- is worse than either failure.
+dialog.issued["f1"] = { step = "first", index = 1, answered = false }
+local f1_ans_ok, f1_ans_err = pcall(wt._answer, "f1", "the answer the reader must see")
+T.ok(f1_ans_ok, "`walkthrough answer` succeeds after a step: " .. tostring(f1_ans_err))
+T.ok(transcript():find("the answer the reader must see", 1, true) ~= nil,
+  "...and the reader can actually see it")
+local f1_rl_ok, f1_rl_err = pcall(wt.reload, "tests/fixtures/two_files.tour")
+T.ok(f1_rl_ok, "`walkthrough reload` reports the success it really had: " .. tostring(f1_rl_err))
+T.ok(wt.state().active, "...and the walkthrough is still active afterwards")
+wt.close()
+
+-- The identity check needs a case of its own. nav no longer draws into the
+-- dialog's window, so nothing in the block above can reach the mismatch any
+-- more -- but anything else in the editor still can: a `:buffer` typed in that
+-- window, another plugin, a future caller of nav that forgets. The property is
+-- that the dialog NOTICES and recovers, rather than insisting it is open while
+-- displaying a code file and raising out of the next answer.
+wt.open("tests/fixtures/two_files.tour")
+local f1b_code_buf = vim.api.nvim_get_current_buf()
+wt.ask()
+local f1b_buf = dialog.bufnr()
+vim.api.nvim_win_set_buf(dialog.winid(), f1b_code_buf)  -- something takes the window
+T.ok(not dialog.is_open(),
+  "a dialog window that has been retargeted at another buffer is not open")
+wt.ask()
+T.ok(dialog.is_open(), "...and <leader>aa brings the dialog back")
+T.eq(vim.api.nvim_win_get_buf(dialog.winid()), f1b_buf,
+  "...into a window that really is displaying the transcript")
+T.eq(dialog.bufnr(), f1b_buf, "...and it is the same transcript")
+dialog.issued["f1b"] = { step = "first", index = 1, answered = false }
+local f1b_ok, f1b_err = pcall(wt._answer, "f1b", "delivered after the window was taken")
+T.ok(f1b_ok, "an answer after a retargeted window still succeeds: " .. tostring(f1b_err))
+T.ok(transcript():find("delivered after the window was taken", 1, true) ~= nil,
+  "...and the reader can see it")
+wt.close()
+
+-- ---------------------------------------------------------------------------
+-- F2 (Critical) — the dialog can be dismissed and reopened, repeatedly.
+--
+-- bufhidden=hide plus a fixed buffer name meant `:q` left the buffer alive with
+-- its name claimed, so the NEXT <leader>aa raised E95 from
+-- nvim_buf_set_name -- after the split had already been created, which left
+-- S.win on the new window and S.buf on the old buffer: F1's corrupt state,
+-- reached from the one key a reader actually reaches for.
+--
+-- Identical-if-broken: `pcall(wt.ask)` returning true is not enough on its own
+-- (a version that silently built a second, empty transcript would pass), so the
+-- buffer identity and the surviving text are asserted too.
+-- ---------------------------------------------------------------------------
+wt.open("tests/fixtures/two_files.tour")
+wt.ask()
+local f2_buf = dialog.bufnr()
+dialog.append({ "you: asked before dismissing it" }, nil)
+T.ok(vim.iter(vim.api.nvim_buf_get_keymap(f2_buf, "n")):any(function(m) return m.lhs == "q" end),
+  "the dialog buffer carries a documented dismiss binding")
+
+-- Pressed as a KEYSTROKE (`:normal` honours mappings), not by calling the
+-- callback: the binding being reachable is half of what is being fixed.
+vim.api.nvim_set_current_win(dialog.winid())
+vim.cmd("normal q")
+T.ok(not dialog.is_open(), "pressing it dismisses the dialog")
+T.eq(vim.api.nvim_buf_is_valid(f2_buf), true, "...and keeps the transcript buffer alive")
+
+local f2_reopened = pcall(wt.ask)
+T.ok(f2_reopened, "the next <leader>aa reopens it (this raised E95)")
+T.ok(dialog.is_open(), "...and the dialog really is open")
+T.eq(dialog.bufnr(), f2_buf, "...it is the SAME transcript, not a fresh empty one")
+T.eq(vim.api.nvim_win_get_buf(dialog.winid()), f2_buf,
+  "...and its window is displaying it")
+T.ok(transcript():find("asked before dismissing it", 1, true) ~= nil,
+  "...with the conversation still in it")
+
+-- The other spelling, and a second cycle: E95 only bit on a reopen, so once is
+-- not a test of "repeatedly".
+vim.api.nvim_set_current_win(dialog.winid())
+vim.cmd("quit")
+T.ok(not dialog.is_open(), ":q dismisses it too")
+dialog.issued["f2"] = { step = "first", index = 1, answered = false }
+T.ok(dialog.answer("f2", "answered while you were not looking"),
+  "an answer that lands while it is dismissed is accepted")
+local f2_again = pcall(wt.ask)
+T.ok(f2_again, "...and it reopens a second time")
+T.eq(dialog.bufnr(), f2_buf, "...still the same transcript")
+T.ok(transcript():find("answered while you were not looking", 1, true) ~= nil,
+  "...and the answer was kept, not dropped on the floor")
+wt.close()
+
+-- Configurable and disablable, like every other binding.
+require("walkthrough").setup({ keys = { dialog_close = "" } })
+wt.open("tests/fixtures/two_files.tour")
+wt.ask()
+T.ok(not vim.iter(vim.api.nvim_buf_get_keymap(dialog.bufnr(), "n")):any(function(m)
+  return m.lhs == "q"
+end), 'keys.dialog_close = "" disables it')
+wt.close()
+require("walkthrough").setup({ keys = { dialog_close = "Q" } })
+wt.open("tests/fixtures/two_files.tour")
+wt.ask()
+T.ok(vim.iter(vim.api.nvim_buf_get_keymap(dialog.bufnr(), "n")):any(function(m)
+  return m.lhs == "Q"
+end), "...and it is configurable through setup{keys=...}")
+-- Nothing of the dialog's leaks onto a code buffer: the default is a bare `q`.
+wt.close()
+require("walkthrough").setup({ keys = { dialog_close = "q" } })
+wt.open("tests/fixtures/two_files.tour")
+T.ok(not vim.iter(vim.api.nvim_buf_get_keymap(vim.api.nvim_get_current_buf(), "n")):any(
+  function(m) return m.lhs == "q" end),
+  "the dismiss key is never bound on a code buffer")
+wt.close()
+
 T.done()

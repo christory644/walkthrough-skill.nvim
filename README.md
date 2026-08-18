@@ -145,6 +145,7 @@ Once a walkthrough is open, in nvim:
 | `]w` / `[w` | next / previous step |
 | `<leader>an` / `<leader>ap` | next / previous step |
 | `<leader>aa` | ask about this step |
+| `q` | dismiss the question panel (in the panel; `<leader>aa` brings it back, with the conversation still in it) |
 | `<leader>aq` | end the walkthrough |
 | `:copen` | the whole tour as a list |
 
@@ -157,7 +158,7 @@ an active walkthrough, and all of them are configurable:
 
 ```lua
 require("walkthrough").setup({
-  keys = { next = "]w", prev = "[w", close = "<leader>aq" },
+  keys = { next = "]w", prev = "[w", close = "<leader>aq", dialog_close = "q" },
 })
 ```
 
