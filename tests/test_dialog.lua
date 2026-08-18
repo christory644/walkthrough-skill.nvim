@@ -274,4 +274,48 @@ T.ok(tostring(vim.wo[dialog.winid()].winbar):find(wt.state().id, 1, true) ~= nil
   "the winbar names the step the question is scoped to")
 wt.close()
 
+-- Review round 2, Important — the winbar's queued state was unreachable:
+-- M.refresh's `elseif M.pending() then` branch is correct in isolation, but
+-- nothing called M.refresh while a question sat in the retry queue, so the
+-- winbar kept showing "idle" for the whole ten-minute retry window.
+--
+-- Identical-if-broken: asserting only `dialog.pending() ~= nil` after a
+-- refusal passes on the broken implementation too -- that fact was always
+-- true, it just never reached the screen. Read the winbar text itself, in
+-- BOTH directions: it must appear while queued and disappear once cleared.
+wt.open("tests/fixtures/two_files.tour")
+wt.ask()
+local real_send2 = channel.send
+channel.send = function(_path, _payload) return false, "no_reader", "no agent is listening" end
+dialog.submit("does anyone answer?")
+channel.send = real_send2
+T.ok(dialog.pending() ~= nil, "the question is queued")
+local winbar = function() return tostring(vim.wo[dialog.winid()].winbar) end
+T.ok(winbar():find("queued", 1, true) ~= nil,
+  "and the winbar says so while it is queued")
+dialog.cancel_pending(true)
+T.ok(dialog.pending() == nil, "the queue is cleared")
+T.ok(winbar():find("queued", 1, true) == nil,
+  "and the winbar stops saying so once cleared")
+
+-- Review round 2, Minor — M.close left the spinner's uv timer running: capture
+-- the actual timer handle M.mark_waiting creates and check IT directly, rather
+-- than trusting that W being nil afterward says anything about whether its
+-- OLD timer was ever stopped.
+local uv = vim.uv or vim.loop
+local captured_timer
+local real_new_timer = uv.new_timer
+uv.new_timer = function(...)
+  captured_timer = real_new_timer(...)
+  return captured_timer
+end
+dialog.issued["n2"] = { step = "s", index = 1, answered = false }
+dialog.mark_waiting("n2")
+uv.new_timer = real_new_timer
+T.ok(captured_timer ~= nil and captured_timer:is_active(),
+  "the spinner timer is running while waiting")
+dialog.close()
+T.ok(not captured_timer:is_active(), "and M.close stops it")
+wt.close()
+
 T.done()

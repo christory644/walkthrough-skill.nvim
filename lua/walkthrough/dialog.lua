@@ -101,8 +101,14 @@ function M.on_reload(ctx)
   M.refresh()
 end
 
+-- Forward-declared: the real definition lives further down, next to the rest
+-- of the "agent is working" state (W). M.close is defined here, above it, so
+-- this upvalue has to exist before that closure is compiled.
+local stop_working
+
 function M.close()
   M.cancel_pending(true)
+  stop_working()
   if S.win and vim.api.nvim_win_is_valid(S.win) then
     pcall(vim.api.nvim_win_close, S.win, true)
   end
@@ -167,7 +173,7 @@ local function draw_working()
   M.refresh()
 end
 
-local function stop_working()
+function stop_working()
   if not W then return end
   if W.timer then pcall(function() W.timer:stop() W.timer:close() end) end
   if W.mark and M.is_open() then
@@ -279,6 +285,11 @@ function M.cancel_pending(quiet)
   if not quiet then
     M.append({ "walkthrough: the question was not sent." }, "Comment")
   end
+  -- The queued state just ended (dropped, expired, or delivered) -- the
+  -- winbar's "queued — waiting for an agent" text is now stale. This is the
+  -- ONLY place P is cleared (M.close, M.submit, and every exit of `attempt`
+  -- all clear it by calling here), so refreshing here covers all of them.
+  M.refresh()
 end
 
 -- The prompt line as the reader currently has it. The queued question is only
@@ -345,6 +356,9 @@ function M.on_refused(text, reason, message)
   P = { text = text, nonce = nil, since = (vim.uv or vim.loop).hrtime() / 1e6 }
   P.timer = (vim.uv or vim.loop).new_timer()
   P.timer:start(M.RETRY_MS, M.RETRY_MS, vim.schedule_wrap(attempt))
+  -- This is the ONLY place P is created -- the winbar's "idle" text is now
+  -- stale until this refreshes it to "queued — waiting for an agent".
+  M.refresh()
 end
 
 -- Returns true, nonce when the question actually reached a reader; otherwise
