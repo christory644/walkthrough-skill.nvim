@@ -189,7 +189,133 @@ LUA
     WT_FIFO="$P5/dialog.fifo" WT_TOUR="$REPO/tests/fixtures/two_files.tour" \
     nvim --headless --clean -l "$P5/drive.lua" >/dev/null 2>&1 )
 check "the FIFO existed while the walkthrough was open" "0" "$?"
-[ -e "$P5/dialog.fifo" ]; check "<leader>aq removes the FIFO" "1" "$?"
+if [ -e "$P5/dialog.fifo" ]; then fifo_gone=0; else fifo_gone=1; fi
+check "<leader>aq removes the FIFO" "1" "$fifo_gone"
+
+# ---------------------------------------------------------------------------
+# OQ-3 — a question refused for want of a reader is KEPT and sent when one
+# arrives. The failure this must not produce is a question landing minutes later
+# that the reader had lost interest in, so: it announces itself, it can be
+# cancelled for as long as it is pending, and it does not fire if the reader
+# changed their mind.
+# ---------------------------------------------------------------------------
+Q="$WORK/q"; mkdir -p "$Q"; mkfifo -m 600 "$Q/dialog.fifo"
+cat > "$Q/pending.lua" <<'LUA'
+vim.opt.runtimepath:append(vim.env.WT_REPO)
+vim.env.WALKTHROUGH_DIALOG = vim.env.WT_FIFO
+local wt = require("walkthrough")
+local dialog = require("walkthrough.dialog")
+wt.setup({ close_surface = false })
+wt.open(vim.env.WT_TOUR)
+wt.ask()
+-- No reader exists yet: this must be refused, kept, and announced.
+dialog.submit("why not a plain spawn here?")
+local p = dialog.pending()
+-- write/close as SEPARATE statements: this nvim's Lua file:write() returns a
+-- bare `true`, not the file handle, so a chained :write(...):close() throws
+-- "attempt to index a boolean value" -- caught only by running this, not by
+-- reading it.
+local f = io.open(vim.env.WT_OUT, "w")
+f:write(table.concat({
+  tostring(p ~= nil),
+  tostring(p and p.text or ""),
+  tostring(vim.iter(vim.api.nvim_buf_get_lines(dialog.bufnr(), 0, -1, false))
+    :any(function(l) return l:find("will send", 1, true) end)),
+}, "|"))
+f:close()
+os.exit(0)
+LUA
+( cd "$REPO" && WT_REPO="$REPO" WT_FIFO="$Q/dialog.fifo" WT_OUT="$Q/out" \
+    WT_TOUR="$REPO/tests/fixtures/two_files.tour" \
+    nvim --headless --clean -l "$Q/pending.lua" >/dev/null 2>&1 )
+res="$(cat "$Q/out")"
+check "refused: the question is kept"          "true" "$(echo "$res" | cut -d'|' -f1)"
+check "refused: kept verbatim"  "why not a plain spawn here?" "$(echo "$res" | cut -d'|' -f2)"
+check "refused: the wait announces itself"     "true" "$(echo "$res" | cut -d'|' -f3)"
+
+# ...and it actually goes when a reader turns up. The reader is started FIRST
+# here and observed waiting, so "it arrived" is not confused with "it was never
+# refused in the first place".
+cat > "$Q/autosend.lua" <<'LUA'
+vim.opt.runtimepath:append(vim.env.WT_REPO)
+vim.env.WALKTHROUGH_DIALOG = vim.env.WT_FIFO
+local wt = require("walkthrough")
+local dialog = require("walkthrough.dialog")
+wt.setup({ close_surface = false })
+wt.open(vim.env.WT_TOUR)
+wt.ask()
+dialog.submit("why not a plain spawn here?")
+assert(dialog.pending(), "must be pending: no reader yet")
+-- Let the retry timer run. vim.wait pumps the event loop, which uv timers need.
+vim.wait(20000, function() return dialog.pending() == nil end, 100)
+local f = io.open(vim.env.WT_OUT, "w")
+f:write(tostring(dialog.pending() == nil))
+f:close()
+os.exit(0)
+LUA
+( cd "$REPO" && WT_REPO="$REPO" WT_FIFO="$Q/dialog.fifo" WT_OUT="$Q/sent" \
+    WT_TOUR="$REPO/tests/fixtures/two_files.tour" \
+    nvim --headless --clean -l "$Q/autosend.lua" >/dev/null 2>&1 ) &
+APID=$!; PIDS+=("$APID")
+# The reader arrives late, on purpose.
+n=0; while [ "$n" -lt 400000 ]; do n=$((n + 1)); done
+got="$(nvim --headless --clean -l "$REPO/lua/walkthrough/await.lua" "$Q/dialog.fifo" 15000 2>/dev/null)"
+wait "$APID"
+check "auto-send: the kept question reached a reader that arrived later" "1" \
+  "$(printf '%s' "$got" | grep -c 'plain spawn' | tr -d ' ')"
+check "auto-send: the pending queue is empty afterwards" "true" "$(cat "$Q/sent")"
+
+# ---------------------------------------------------------------------------
+# OQ-3, the other binding half: a queued question does NOT fire if the reader
+# edited or cleared the prompt line since. Submitted with NO reader attached
+# (so it queues, exactly like the pending/auto-send tests above), edited
+# immediately after, and only THEN does a reader turn up -- late, same as the
+# auto-send test, so this cannot pass merely because no reader ever arrived.
+# If the guard in `attempt` were missing, this late reader would receive the
+# stale question instead of timing out with nothing.
+# ---------------------------------------------------------------------------
+cat > "$Q/edited.lua" <<'LUA'
+vim.opt.runtimepath:append(vim.env.WT_REPO)
+vim.env.WALKTHROUGH_DIALOG = vim.env.WT_FIFO
+local wt = require("walkthrough")
+local dialog = require("walkthrough.dialog")
+wt.setup({ close_surface = false })
+wt.open(vim.env.WT_TOUR)
+wt.ask()
+dialog.submit("why not a plain spawn here?")
+assert(dialog.pending(), "must be pending: no reader yet")
+-- The reader changed their mind before any reader turned up.
+local buf = dialog.bufnr()
+local last = vim.api.nvim_buf_line_count(buf)
+vim.api.nvim_buf_set_lines(buf, last - 1, last, false, { "> never mind" })
+vim.wait(20000, function() return dialog.pending() == nil end, 100)
+local dropped_msg = vim.iter(vim.api.nvim_buf_get_lines(buf, 0, -1, false)):any(function(l)
+  return l:find("you changed the question", 1, true)
+end)
+local f = io.open(vim.env.WT_OUT, "w")
+f:write(table.concat({
+  tostring(dialog.pending() == nil),
+  tostring(dropped_msg),
+}, "|"))
+f:close()
+os.exit(0)
+LUA
+( cd "$REPO" && WT_REPO="$REPO" WT_FIFO="$Q/dialog.fifo" WT_OUT="$Q/e_out" \
+    WT_TOUR="$REPO/tests/fixtures/two_files.tour" \
+    nvim --headless --clean -l "$Q/edited.lua" >/dev/null 2>&1 ) &
+EPID=$!; PIDS+=("$EPID")
+# The reader arrives late, on purpose -- same delay as the auto-send test, so
+# a reader IS listening by the time the retry ticks, and would receive the
+# stale question if the "you changed it" guard were not there.
+n=0; while [ "$n" -lt 400000 ]; do n=$((n + 1)); done
+e_got="$(nvim --headless --clean -l "$REPO/lua/walkthrough/await.lua" "$Q/dialog.fifo" 6000 2>/dev/null)"
+e_grc=$?
+wait "$EPID"
+eres="$(cat "$Q/e_out")"
+check "edited: the stale question is dropped, not kept forever" "true" "$(echo "$eres" | cut -d'|' -f1)"
+check "edited: the drop is announced"                            "true" "$(echo "$eres" | cut -d'|' -f2)"
+check "edited: the late reader received NOTHING (times out)"    "4"    "$e_grc"
+check "edited: ...and printed nothing"           "0" "$(printf '%s' "$e_got" | wc -c | tr -d ' ')"
 
 echo
 [ "$fail" -eq 0 ] && echo "DIALOG FIFO TESTS PASSED" || echo "DIALOG FIFO TESTS FAILED"

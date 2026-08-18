@@ -79,6 +79,8 @@ function M.open(ctx)
   vim.cmd(string.format("botright %dsplit", M.HEIGHT))
   S.win = vim.api.nvim_get_current_win()
   S.buf = make_buffer()
+  vim.api.nvim_buf_create_user_command(S.buf, "WalkthroughCancel",
+    function() M.cancel_pending() end, { desc = "drop the queued question" })
   vim.api.nvim_win_set_buf(S.win, S.buf)
   vim.wo[S.win].number = false
   vim.wo[S.win].relativenumber = false
@@ -100,6 +102,7 @@ function M.on_reload(ctx)
 end
 
 function M.close()
+  M.cancel_pending(true)
   if S.win and vim.api.nvim_win_is_valid(S.win) then
     pcall(vim.api.nvim_win_close, S.win, true)
   end
@@ -155,6 +158,142 @@ local function next_nonce()
   return string.format("%x-%d", (vim.uv or vim.loop).hrtime(), S.seq)
 end
 
+-- The retry interval. Each tick is a full send ATTEMPT, not a probe: there is
+-- no way to ask "is anyone listening?" without an open, and an open that does
+-- not write ends the agent's read with an empty, successful result. A refused
+-- attempt costs an ENXIO at 0.03 ms, so a one-second tick is free.
+M.RETRY_MS = 1000
+-- After ten minutes nobody is coming. The text stays in the prompt line; only
+-- the timer stops. A question that lands after the reader has forgotten it is
+-- the failure OQ-3 exists to prevent, and an unbounded timer is how you get one.
+M.PENDING_LIMIT_MS = 600000
+
+local P = nil  -- { text, nonce, timer, since }
+
+function M.pending()
+  if not P then return nil end
+  return { text = P.text, since_ms = (vim.uv or vim.loop).hrtime() / 1e6 - P.since }
+end
+
+function M.cancel_pending(quiet)
+  if not P then return end
+  if P.timer then pcall(function() P.timer:stop() P.timer:close() end) end
+  P = nil
+  if not quiet then
+    M.append({ "walkthrough: the question was not sent." }, "Comment")
+  end
+end
+
+-- The prompt line as the reader currently has it. The queued question is only
+-- auto-sent while this still matches: "does not fire if the buffer has been
+-- edited or cleared since" is the binding half of OQ-3.
+local function prompt_text()
+  if not M.is_open() then return nil end
+  local lines = vim.api.nvim_buf_get_lines(S.buf, -2, -1, false)
+  local line = lines[1] or ""
+  return (line:gsub("^" .. vim.pesc(vim.fn.prompt_getprompt(S.buf)), ""))
+end
+
+-- Puts `text` back in the (last) prompt line. M.submit is reached two ways:
+-- a real keystroke, where the prompt line already shows what was typed, and a
+-- programmatic call (attempt's own retry, and anything else that calls
+-- M.submit/M.send_now directly) where nothing was ever typed at all -- the
+-- buffer's prompt line is still bare. Without this, `prompt_text() == P.text`
+-- would never hold for a programmatic submission, and OQ-3's own auto-send
+-- would refuse itself as "you changed the question" on its very first tick.
+-- Measured: writing here during the prompt callback is NOT clobbered by nvim
+-- afterwards -- nvim only fills the last line with the bare prompt when the
+-- callback left it untouched.
+local function set_prompt_text(text)
+  if not M.is_open() then return end
+  local last = vim.api.nvim_buf_line_count(S.buf)
+  vim.api.nvim_buf_set_lines(S.buf, last - 1, last, false,
+    { vim.fn.prompt_getprompt(S.buf) .. text })
+end
+
+local function attempt()
+  if not P then return end
+  if not M.is_open() then M.cancel_pending(true) return end
+  -- The reader changed their mind, or typed something else. Their edit wins.
+  if vim.trim(prompt_text() or "") ~= P.text then
+    M.append({ "walkthrough: you changed the question, so the earlier one was dropped." },
+      "Comment")
+    M.cancel_pending(true)
+    return
+  end
+  if (vim.uv or vim.loop).hrtime() / 1e6 - P.since > M.PENDING_LIMIT_MS then
+    M.append({ "walkthrough: no agent came, so this was not sent. Ask again when one is." },
+      "WarningMsg")
+    M.cancel_pending(true)
+    return
+  end
+  local ok = M.send_now(P.text, P.nonce)
+  if ok then M.cancel_pending(true) end
+end
+
+function M.on_refused(text, reason, message)
+  -- Only the transport is refused, and only for want of a reader. Everything
+  -- else -- too long, a NUL, a short write -- is the reader's problem to fix and
+  -- queueing it would just repeat the same failure every second.
+  if reason ~= "no_reader" and reason ~= "gone" then
+    M.append({ "walkthrough: " .. tostring(message) }, "WarningMsg")
+    return
+  end
+  M.append({
+    "walkthrough: " .. tostring(message) .. " — your question is kept and will send",
+    "  itself as soon as one is. :WalkthroughCancel drops it; editing the line",
+    "  below drops it too.",
+  }, "WarningMsg")
+  set_prompt_text(text)
+  P = { text = text, nonce = nil, since = (vim.uv or vim.loop).hrtime() / 1e6 }
+  P.timer = (vim.uv or vim.loop).new_timer()
+  P.timer:start(M.RETRY_MS, M.RETRY_MS, vim.schedule_wrap(attempt))
+end
+
+-- Returns true, nonce when the question actually reached a reader; otherwise
+-- false, reason, message. The nonce is returned on success (not just recorded
+-- in M.issued) because M.submit is a public interface and Task 7's test
+-- asserts on the nonce it hands back.
+function M.send_now(text, nonce)
+  local ctx = S.ctx or {}
+  nonce = nonce or next_nonce()
+  local payload = vim.json.encode({
+    tour = ctx.tour or "", step_id = ctx.step_id or "", index = ctx.index or 0,
+    question = text, nonce = nonce,
+  })
+  local ok, reason, message = channel.send(ctx.fifo, payload)
+  if ok then
+    M.issued[nonce] = { step = ctx.step_id, index = ctx.index, answered = false }
+    -- text is allowed to contain \n (M.submit's control-char guard deliberately
+    -- lets \n and \t through), and nvim_buf_set_lines refuses any array element
+    -- that embeds a newline -- an unsanitised "you: " .. text raises "'replacement
+    -- string' item contains newlines" for a multi-line question, AFTER the send
+    -- already succeeded and the nonce is already recorded. Route through
+    -- M.sanitise, exactly as M.answer does, so the echo is one buffer line per
+    -- source line, same as the transcript for an agent's answer. This path is
+    -- reached both from a keystroke (M.submit) and programmatically, with no
+    -- keystroke at all, from the auto-send retry (attempt) -- the sanitising
+    -- has to live here, not in the caller, so both keep it.
+    local echo = M.sanitise(text)
+    echo[1] = "you: " .. echo[1]
+    M.append(echo, nil)
+    M.clear_prompt()
+    M.on_sent(nonce)
+    return true, nonce
+  end
+  return false, reason, message
+end
+
+function M.clear_prompt()
+  if not M.is_open() then return end
+  local last = vim.api.nvim_buf_line_count(S.buf)
+  vim.api.nvim_buf_set_lines(S.buf, last - 1, last, false,
+    { vim.fn.prompt_getprompt(S.buf) })
+end
+
+-- Grown into the spinner in the next task.
+function M.on_sent(_nonce) end
+
 function M.submit(text)
   text = vim.trim(tostring(text or ""))
   if text == "" then return end
@@ -166,45 +305,12 @@ function M.submit(text)
     return
   end
 
-  local ctx = S.ctx or {}
-  local nonce = next_nonce()
-  local payload = vim.json.encode({
-    tour = ctx.tour or "",
-    step_id = ctx.step_id or "",
-    index = ctx.index or 0,
-    question = text,
-    nonce = nonce,
-  })
-
-  local ok, reason, message = channel.send(ctx.fifo, payload)
-  if ok then
-    M.issued[nonce] = { step = ctx.step_id, index = ctx.index, answered = false }
-    -- text is allowed to contain \n (the control-char guard above deliberately
-    -- lets \n and \t through), and nvim_buf_set_lines refuses any array element
-    -- that embeds a newline -- an unsanitised "you: " .. text raises "'replacement
-    -- string' item contains newlines" for a multi-line question, AFTER the send
-    -- already succeeded and the nonce is already recorded. Route through
-    -- M.sanitise, exactly as M.answer does, so the echo is one buffer line per
-    -- source line, same as the transcript for an agent's answer.
-    local echo = M.sanitise(text)
-    echo[1] = "you: " .. echo[1]
-    M.append(echo, nil)
-    M.on_sent(nonce)
-    return true, nonce
-  end
-  M.on_refused(text, reason, message)
-  return false, reason
+  M.cancel_pending(true)  -- a new question replaces a queued one
+  local ok, a, b = M.send_now(text)
+  if ok then return true, a end  -- a is the nonce
+  M.on_refused(text, a, b)  -- a, b are reason, message
+  return false, a
 end
-
--- Grown into the pending/auto-send queue in the next task. Until then a refusal
--- is simply reported, which is already better than the silence this replaces.
-function M.on_refused(_text, _reason, message)
-  M.append({ "walkthrough: " .. tostring(message) }, "WarningMsg")
-end
-
--- Grown into the spinner in the "agent is working" task; a no-op until then so
--- M.submit has no dangling call.
-function M.on_sent(_nonce) end
 
 -- Control characters and NUL are stripped at the boundary, not deeper in.
 --
