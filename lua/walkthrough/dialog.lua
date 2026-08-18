@@ -141,9 +141,106 @@ function M.append(lines, hl)
   end
 end
 
--- Grown into the winbar in the "agent is working" task; a no-op until then so
--- nothing here has a dangling call.
-function M.refresh() end
+-- How long the reader's side waits before saying so. Longer than `await`'s
+-- default budget on purpose: await bounds how long the AGENT waits for a
+-- question, and the agent still has to compose an answer after receiving one.
+-- These are two different clocks measuring two different things.
+M.ANSWER_TIMEOUT_MS = 300000
+
+local SPINNER = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" }
+local W = nil  -- { nonce, since, timer, frame, mark }
+
+-- Tier 1: a live line drawn as an EXTMARK, not as text, so the answer replaces
+-- it and the transcript is never littered with dead spinners.
+local function draw_working()
+  if not (M.is_open() and W) then return end
+  local uv = vim.uv or vim.loop
+  local secs = math.floor((uv.hrtime() / 1e6 - W.since) / 1000)
+  W.frame = (W.frame % #SPINNER) + 1
+  local at = math.max(vim.api.nvim_buf_line_count(S.buf) - 1, 0)
+  W.mark = vim.api.nvim_buf_set_extmark(S.buf, M.NS, at, 0, {
+    id = W.mark,
+    virt_lines = { { { string.format("  %s the agent is working (%d:%02d)",
+      SPINNER[W.frame], math.floor(secs / 60), secs % 60), "Comment" } } },
+    virt_lines_above = true,
+  })
+  M.refresh()
+end
+
+local function stop_working()
+  if not W then return end
+  if W.timer then pcall(function() W.timer:stop() W.timer:close() end) end
+  if W.mark and M.is_open() then
+    pcall(vim.api.nvim_buf_del_extmark, S.buf, M.NS, W.mark)
+  end
+  W = nil
+  M.refresh()
+end
+
+function M.mark_waiting(nonce)
+  stop_working()
+  local uv = vim.uv or vim.loop
+  W = { nonce = nonce, since = uv.hrtime() / 1e6, frame = 0, mark = nil }
+  W.timer = uv.new_timer()
+  W.timer:start(0, 100, vim.schedule_wrap(function()
+    if not W then return end
+    if (uv.hrtime() / 1e6 - W.since) > M.ANSWER_TIMEOUT_MS then
+      local q = M.issued[W.nonce]
+      if q then q.timed_out = true end
+      stop_working()
+      -- One of four distinguishable terminal states. This one is "the agent
+      -- stopped waiting", which is a different fact from "no agent is
+      -- listening" (never attached) and from "the agent went away" (died
+      -- mid-wait) -- the reader can act on the difference.
+      M.append({ "walkthrough: the agent stopped waiting — ask again." }, "WarningMsg")
+      return
+    end
+    draw_working()
+  end))
+end
+
+function M.on_sent(nonce) M.mark_waiting(nonce) end
+
+-- Replaces the receipt stub.
+function M.answer(nonce, text)
+  local q = M.issued[nonce]
+  if not q then
+    return false, "no question is waiting on that nonce: " .. tostring(nonce)
+  end
+  if W and W.nonce == nonce then stop_working() end
+  local lines = M.sanitise(text)
+  if q.answered or q.timed_out then
+    -- OQ-4: append, clearly marked, and NAME THE STEP. The likeliest moment for
+    -- a late answer to land is after the reader has moved on, and the step is
+    -- what tells them whether to care without scrolling back.
+    table.insert(lines, 1, string.format(
+      "agent (late — this answers step %s, \"%s\"):",
+      tostring(q.index), tostring(q.step)))
+  else
+    table.insert(lines, 1, "agent:")
+  end
+  q.answered = true
+  M.append(lines, nil)
+  return true
+end
+
+-- Tier 2: one line on the dialog window, carrying the step the question is
+-- scoped to and the elapsed time. It costs a line, survives scrolling, and is
+-- where "an agent is attached / none is" belongs when nothing is in flight.
+function M.refresh()
+  if not M.is_open() then return end
+  local ctx = S.ctx or {}
+  local right = "idle"
+  if W then
+    local secs = math.floor(((vim.uv or vim.loop).hrtime() / 1e6 - W.since) / 1000)
+    right = string.format("waiting %d:%02d", math.floor(secs / 60), secs % 60)
+  elseif M.pending() then
+    right = "queued — waiting for an agent"
+  end
+  vim.wo[S.win].winbar = string.format("ask · step %s/%s %s · %%=%s ",
+    tostring(ctx.index or "?"), tostring(ctx.count or "?"),
+    ctx.step_id and ('"' .. ctx.step_id .. '"') or "", right)
+end
 
 -- Frame the question and hand it to the channel. One JSON line: JSON escaping
 -- IS the encoding, so a quote or a newline in the question is data rather than
@@ -291,9 +388,6 @@ function M.clear_prompt()
     { vim.fn.prompt_getprompt(S.buf) })
 end
 
--- Grown into the spinner in the next task.
-function M.on_sent(_nonce) end
-
 function M.submit(text)
   text = vim.trim(tostring(text or ""))
   if text == "" then return end
@@ -323,18 +417,6 @@ function M.sanitise(text)
     :gsub("\r\n", "\n")
     :gsub("[%z\1-\8\11\12\13\14-\31\127]", "")
   return vim.split(clean, "\n", { plain = true })
-end
-
--- Stub receipt path: records the answer against the nonce it was issued
--- under. Task 7 replaces this with the real renderer/transcript.
-function M.answer(nonce, text)
-  local q = M.issued[nonce]
-  if not q then
-    return false, "no question is waiting on that nonce: " .. tostring(nonce)
-  end
-  q.lines = M.sanitise(text)
-  q.answered = true
-  return true
 end
 
 return M

@@ -221,4 +221,57 @@ T.eq(sent_tour("still about the same tour?"), abspath,
   "ctx.tour after a FAILED reload (previous tour restored) is still the original absolute path")
 wt.close()
 
+-- P7 — a timeout is distinguishable from a slow answer.
+--
+-- Identical-if-broken: "the dialog eventually shows something" passes when the
+-- answer merely arrived late. The nonce is what makes this decidable, so assert
+-- the timeout state at the budget AND that a later answer is marked late.
+wt.open("tests/fixtures/two_files.tour")
+wt.ask()
+dialog.ANSWER_TIMEOUT_MS = 200
+-- send_now returns (true, nonce) on success but (false, reason, message) on
+-- failure; there is no channel here, so this is expected to fail, and the
+-- second value is a REASON, not a nonce.
+local ok, why = dialog.send_now("why not a plain spawn?")
+T.eq(ok, false, "with no channel there is nothing to send")
+
+-- Issue a nonce directly: this test is about receipt, not transport.
+dialog.issued["n1"] = { step = "the retry", index = 1, answered = false }
+dialog.mark_waiting("n1")
+vim.wait(1500, function() return dialog.issued["n1"].timed_out end, 50)
+T.ok(dialog.issued["n1"].timed_out, "the question times out at its budget")
+local body = function()
+  return table.concat(vim.api.nvim_buf_get_lines(dialog.bufnr(), 0, -1, false), "\n")
+end
+T.ok(body():find("stopped waiting", 1, true) ~= nil,
+  "and the buffer says the agent stopped waiting")
+
+-- OQ-4 — a late answer is APPENDED, clearly marked, and NAMES THE STEP: the
+-- likeliest moment for one to land is after the reader has moved on, and naming
+-- the step tells them whether to care without scrolling.
+local accepted = dialog.answer("n1", "because a spawned process has no supervisor.")
+T.ok(accepted, "a late answer is accepted, not discarded")
+T.ok(body():find("no supervisor", 1, true) ~= nil, "its text is appended")
+T.ok(body():find("the retry", 1, true) ~= nil, "and it names the step it answers")
+T.ok(body():lower():find("late", 1, true) ~= nil, "and it is marked late")
+
+-- An answer to a nonce nobody issued is refused outright.
+local ok2, why2 = dialog.answer("never-issued", "hello")
+T.eq(ok2, false, "an unissued nonce is refused")
+T.ok(tostring(why2):find("no question", 1, true) ~= nil, "and says why")
+
+-- The spinner is an extmark, so the answer replaces it rather than leaving a
+-- dead spinner in the transcript.
+T.ok(not body():find("⠋", 1, true), "no dead spinner text in the transcript")
+
+-- Tier 2: the winbar carries the step and the elapsed time. Controller ruling:
+-- the fixture's first step (the one wt.ask() above actually scoped to) is
+-- titled "first", not "the retry" -- "the retry" is only the label stashed on
+-- the n1 nonce issued directly above, used by the transcript assertions. Read
+-- the live step id from wt.state() rather than hardcoding a title, so this
+-- assertion cannot drift from the fixture.
+T.ok(tostring(vim.wo[dialog.winid()].winbar):find(wt.state().id, 1, true) ~= nil,
+  "the winbar names the step the question is scoped to")
+wt.close()
+
 T.done()
