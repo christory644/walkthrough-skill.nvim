@@ -161,6 +161,36 @@ n=0; while kill -0 "$OPID" 2>/dev/null && [ "$n" -lt 50 ]; do n=$((n + 1)); slee
 kill -0 "$OPID" 2>/dev/null && kill -9 "$OPID" 2>/dev/null
 wait "$OPID" 2>/dev/null
 
+
+# ---------------------------------------------------------------------------
+# P5 — teardown removes the FIFO on the path the reader ACTUALLY uses.
+#
+# Identical-if-broken: asserting only "the path does not exist afterwards"
+# passes if the FIFO was never created, and passes on the `walkthrough close`
+# path while leaking on the common one. So: assert it exists WHILE the
+# walkthrough is open, then that <leader>aq's own code path removed it.
+# ---------------------------------------------------------------------------
+P5="$WORK/p5"; mkdir -p "$P5"
+mkfifo -m 600 "$P5/dialog.fifo"; touch "$P5/state" "$P5/sock"
+cat > "$P5/drive.lua" <<'LUA'
+vim.opt.runtimepath:append(vim.env.WT_REPO)
+vim.env.WALKTHROUGH_STATE  = vim.env.WT_STATE
+vim.env.WALKTHROUGH_SOCKET = vim.env.WT_SOCKET
+vim.env.WALKTHROUGH_DIALOG = vim.env.WT_FIFO
+local wt = require("walkthrough")
+wt.setup({ close_surface = false })
+wt.open(vim.env.WT_TOUR)
+assert(vim.uv.fs_stat(vim.env.WT_FIFO), "the FIFO must exist while the walkthrough is open")
+-- This is what <leader>aq is bound to. Not the CLI's close.
+wt.close()
+os.exit(0)
+LUA
+( cd "$REPO" && WT_REPO="$REPO" WT_STATE="$P5/state" WT_SOCKET="$P5/sock" \
+    WT_FIFO="$P5/dialog.fifo" WT_TOUR="$REPO/tests/fixtures/two_files.tour" \
+    nvim --headless --clean -l "$P5/drive.lua" >/dev/null 2>&1 )
+check "the FIFO existed while the walkthrough was open" "0" "$?"
+[ -e "$P5/dialog.fifo" ]; check "<leader>aq removes the FIFO" "1" "$?"
+
 echo
 [ "$fail" -eq 0 ] && echo "DIALOG FIFO TESTS PASSED" || echo "DIALOG FIFO TESTS FAILED"
 exit "$fail"

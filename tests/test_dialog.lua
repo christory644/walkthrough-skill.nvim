@@ -125,4 +125,58 @@ T.ok(not dialog.is_open(), "close takes the dialog away")
 T.eq(vim.api.nvim_get_current_tabpage(), code_tab, "and leaves the reader in the tab")
 wt.close()
 
+-- The keybinding is buffer-local, configurable, and disabled by "".
+--
+-- nvim_*_get_keymap's lhs is already resolved through 'mapleader' at
+-- registration time (measured directly: with mapleader unset, a mapping set
+-- via "<leader>aa" is stored and reported back as the literal two bytes
+-- "\aa", never the eight-byte text "<Leader>aa"). So `has` below resolves the
+-- same way, rather than comparing against the unresolved "<Leader>aa" text,
+-- which would never match any real keymap regardless of correctness.
+local leader_aa = (vim.g.mapleader or "\\") .. "aa"
+wt.open("tests/fixtures/two_files.tour")
+local buf = vim.api.nvim_get_current_buf()
+local maps = vim.api.nvim_buf_get_keymap(buf, "n")
+local has = function(lhs)
+  return vim.iter(maps):any(function(m) return m.lhs == lhs end)
+end
+T.ok(has(leader_aa), "<leader>aa is mapped in a tour buffer")
+wt.close()
+
+require("walkthrough").setup({ keys = { ask = "" } })
+wt.open("tests/fixtures/two_files.tour")
+maps = vim.api.nvim_buf_get_keymap(vim.api.nvim_get_current_buf(), "n")
+T.ok(not has(leader_aa), 'keys.ask = "" disables it')
+wt.close()
+require("walkthrough").setup({ keys = { ask = "<leader>aa" } })
+
+-- Nothing is bound globally.
+T.ok(not vim.iter(vim.api.nvim_get_keymap("n")):any(function(m)
+  return m.lhs == leader_aa
+end), "nothing is bound globally")
+
+-- teardown takes the dialog with it. The dialog buffer is deliberately NOT in
+-- state.touched -- see docs/superpowers/plans § Divergences -- so this is what
+-- proves it is not leaked anyway.
+wt.open("tests/fixtures/two_files.tour")
+wt.ask()
+T.ok(dialog.is_open(), "ask opens the dialog")
+local dbuf = dialog.bufnr()
+wt.close()
+T.ok(not dialog.is_open(), "close takes the dialog with it")
+T.eq(vim.api.nvim_buf_is_valid(dbuf), false, "and wipes its buffer")
+
+-- ...and a reload KEEPS it, because "a tour rewritten by an answer goes through
+-- the existing reload" -- destroying the dialog there would destroy the answer
+-- that caused the rewrite.
+wt.open("tests/fixtures/two_files.tour")
+wt.ask()
+dialog.append({ "agent: an answer worth keeping" }, nil)
+wt.reload("tests/fixtures/two_files.tour")
+T.ok(dialog.is_open(), "a reload keeps the dialog open")
+T.ok(vim.iter(vim.api.nvim_buf_get_lines(dialog.bufnr(), 0, -1, false)):any(function(l)
+  return l:find("worth keeping", 1, true)
+end), "and keeps the transcript")
+wt.close()
+
 T.done()

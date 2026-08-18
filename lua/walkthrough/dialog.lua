@@ -88,6 +88,17 @@ function M.open(ctx)
   vim.cmd("startinsert")
 end
 
+-- A reload re-renders everything the reader is looking at, and the step the
+-- transcript is scoped to may have moved or gone. Say so in the transcript
+-- rather than silently re-scoping: a question two lines above the notice was
+-- asked about a different version of the tour.
+function M.on_reload(ctx)
+  if not M.is_open() then return end
+  S.ctx = ctx
+  M.append({ "— the tour was reloaded —" }, "Comment")
+  M.refresh()
+end
+
 function M.close()
   if S.win and vim.api.nvim_win_is_valid(S.win) then
     pcall(vim.api.nvim_win_close, S.win, true)

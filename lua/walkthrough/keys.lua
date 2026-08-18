@@ -3,6 +3,7 @@ local M = {}
 M.defaults = {
   next = "]w", prev = "[w", close = "<leader>aq",
   next_cmd = "<leader>an", prev_cmd = "<leader>ap",
+  ask = "<leader>aa",
 }
 
 function M.attach(bufnr, keys)
@@ -17,9 +18,14 @@ function M.attach(bufnr, keys)
   map(keys.next_cmd, function() wt.step(1) end, "next step")
   map(keys.prev_cmd, function() wt.step(-1) end, "prev step")
   map(keys.close, function() wt.close() end, "end walkthrough")
+  map(keys.ask, function() wt.ask() end, "ask about this step")
 
+  -- The group is registered if EITHER binding still lives under <leader>a. It
+  -- used to hang off keys.close alone, so a reader who rebound close — and kept
+  -- ask where it was — silently lost the label for the group ask is in.
   local ok, wk = pcall(require, "which-key")
-  if ok and wk.add and keys.close and keys.close:match("^<leader>a") then
+  local under_a = function(k) return type(k) == "string" and k:match("^<leader>a") ~= nil end
+  if ok and wk.add and (under_a(keys.close) or under_a(keys.ask)) then
     wk.add({ { "<leader>a", group = "agent", buffer = bufnr } })
   end
 end

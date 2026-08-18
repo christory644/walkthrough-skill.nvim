@@ -32,6 +32,23 @@ end
 
 local function remember(b) state.touched[b] = true end
 
+-- The question has to carry the tour's ABSOLUTE path: durable tours are
+-- co-located with what they describe and throwaway ones live in a temp
+-- directory, so there is no canonical location for the agent to infer.
+--
+-- It is kept beside the tour rather than on it: `tour.validate` owns the fields
+-- it computes, and a .tour file is untrusted input — a document that named its
+-- own `path` must not be believed.
+local function dialog_ctx()
+  return {
+    fifo = vim.env.WALKTHROUGH_DIALOG,
+    tour = state.path or "",
+    step_id = state.tour and tour_mod.step_id(state.tour, state.index) or "",
+    index = state.index,
+    count = state.tour and #state.tour.steps or 0,
+  }
+end
+
 -- Attach the current config.keys to buf and record exactly that table, so a
 -- later detach (whenever it happens) removes what was really bound here,
 -- independent of anything setup() does to config.keys in between.
@@ -110,6 +127,12 @@ end
 -- running in. Shared by close() and by the one abort path in open(), which
 -- must not leave a half-open walkthrough behind.
 local function teardown()
+  -- The dialog is closed explicitly rather than by riding on state.touched.
+  -- Registering it there would put it in M.reload's `silent! edit!` loop, which
+  -- is wrong for a prompt buffer and would destroy a transcript the reload was
+  -- very likely CAUSED by -- an answer that rewrote the tour. Explicit here,
+  -- explicit in reload, and nothing is leaked either way.
+  dialog.close()
   for b in pairs(state.touched) do
     if vim.api.nvim_buf_is_valid(b) then
       render.clear(b)
@@ -163,6 +186,8 @@ function M.open(path_or_tour)
 
   state.tour, state.index, state.touched, state.skipped = t, 1, {}, skipped
   state.attached = {}
+  state.path = type(path_or_tour) == "string"
+    and vim.fn.fnamemodify(path_or_tour, ":p") or nil
 
   -- `state.active` means "this walkthrough is fully installed", so it is set
   -- LAST -- after the quickfix list, the autocmd and the first jump have all
@@ -234,6 +259,13 @@ end
 
 function M.step(delta) M.goto_step(state.index + delta) end
 
+function M.ask()
+  -- Raise rather than return quietly, for the same reason goto_step does: a
+  -- --remote-expr call that returns quietly reaches the shell as exit 0.
+  if not state.active then error("no walkthrough is open: nothing to ask about", 0) end
+  dialog.open(dialog_ctx())
+end
+
 -- Restore the reader's position by step id, which is what survives a tour being
 -- rewritten under them: indices move, titles do not.
 local function goto_id(id)
@@ -278,6 +310,8 @@ function M.reload(path_or_tour)
   -- state.touched: that reset discards the only record that these buffers
   -- were ever part of a walkthrough, so any that drop out of the new tour
   -- would otherwise keep their keymaps for the life of the process.
+  -- Keep the dialog. See teardown.
+  local dialog_was_open = dialog.is_open()
   for b in pairs(state.touched) do
     if vim.api.nvim_buf_is_valid(b) then
       render.clear(b)
@@ -302,6 +336,7 @@ function M.reload(path_or_tour)
       " (and the previous walkthrough could not be restored, so it is closed)", 0)
   end
   goto_id(previous)
+  if dialog_was_open then dialog.on_reload(dialog_ctx()) end
   return M.state()
 end
 
