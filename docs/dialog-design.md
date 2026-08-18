@@ -1,6 +1,7 @@
 # The in-nvim dialog — design
 
-**Status:** proposal, awaiting the owner's ruling on § Open questions
+**Status:** ruled. All six open questions were decided by the owner on
+2026-08-17; see § Decisions. Ready to become an implementation plan.
 **Date:** 2026-08-14
 **Scope:** issue #21. `docs/design.md` § "Dialog — the core interaction" is the
 parent document; this one supersedes it wherever the two disagree, because parts
@@ -406,38 +407,75 @@ only one of the two that has an answer.
   quickfix list is a single global slot the reader can claim at any moment;
   `nav.is_our_qflist` exists because that has already gone wrong once.
 
-## Open questions
+## Decisions
 
-**Ruled on by the owner. Nothing below is settled by this document.**
+All six were ruled on 2026-08-17. The reasoning is recorded because the choice
+matters less than why it was made — a later reader needs to know which of these
+would change if its premise changed.
 
-**OQ-1 — FIFO or spool, behind the verbs?** § 7. Rule on this first: the
-`SKILL.md` wording, the state-file key, and half the test suite hang off it. The
-document leans FIFO, on measured evidence, with the spool a one-function swap.
+**OQ-1 — FIFO, plain, behind the verbs.** Delegated to the implementer after the
+owner ruled that **two agents attached to one walkthrough is not a feature they
+want**, which removed the FIFO's only genuine disqualifier. Chosen over the spool
+because liveness and delivery collapse into one syscall; a spool needs a
+heartbeat *plus* a write, two facts that can disagree, and the gap between them is
+where a frozen editor would live. The verbs are **not** pre-shaped for a spool:
+that would be complexity bought for a case ruled out.
 
-**OQ-2 — Layout A (bottom split) or B (right vertical)?** § 2. A is proposed
-because B's cost falls on the code and the narration; B reads more like a chat.
+*The cost, accepted knowingly:* the spool would have been easier to test
+honestly. Proving "a question arrived" over a FIFO needs two orchestrated
+processes, and this project's recurring defect is the assertion that passes for
+the wrong reason. So § 6's two negative controls are **mandatory, not
+nice-to-have**: a write with no reader must return `ENXIO` without blocking, and
+every "it arrived" assertion must distinguish arrival from a reader that was
+never blocked.
 
-**OQ-3 — A second question while one is pending: refuse, or queue?** Refusing is
-truthful and trivial with a FIFO (`ENXIO` decides it). Queueing is friendlier and
-needs the spool. This is partly downstream of OQ-1, but not entirely — the
-answer changes what the reader is told, which is a product question.
+**OQ-2 — Layout A**, bottom split, full width. The cost of B is measured and
+lands on the reader: narration is drawn *inside* the code window, so halving that
+window re-wraps every note in the tour for as long as the dialog is open — the
+reader opens a dialog because a note was unclear, and opening it degrades every
+note. **Not configurable in v1**: one layout that works beats two that half-work,
+and evidence of cramping is a better reason to change it than speculation.
 
-**OQ-4 — A late answer, arriving after the timeout: drop or append?** Dropping
-means work is thrown away; appending means text lands in a transcript the reader
-has already moved on from. The nonce makes either implementable.
+**OQ-3 — Refuse the transport, keep the text, auto-send when free.** `ENXIO`
+tells the truth for free; the reader should not be punished for the mechanism.
+The typed question stays in the prompt buffer and sends itself when the agent
+returns. **Two constraints follow and are binding:** the auto-send announces
+itself with a beat to cancel, and it does not fire if the buffer has been edited
+or cleared since. A question arriving minutes later that the reader had lost
+interest in is the failure this must not produce.
 
-**OQ-5 — A question for a walkthrough this agent did not open: answer, or
-refuse?** § 4.7 proposes "answer, after reading, and say so". Refusing is safer
-and more annoying, and it makes the dialog useless for any tour opened by hand.
+**OQ-4 — Append, clearly marked as late.** Nothing the agent did is discarded and
+the nonce makes it unambiguous which question it answers. **The marking names the
+step**, not merely "late": the likeliest moment for a late answer to land is
+after the reader has moved on, and naming the step tells them whether to care
+without scrolling.
 
-**OQ-6 — Does the surface title change with dialog state (#24 follow-on)?** It
-is the only indicator visible from the chat tab, and it is the only tier
-requiring new plumbing (a `_title` verb the plugin calls, as it calls
-`_close_surface`). Worth it, or is the in-buffer indicator enough for v1?
+**OQ-5 — Answer, but read the tour and the step's file first, and say so.**
+Refusing would make the dialog useless for committed, hand-authored tours — the
+case this project spent its generalisation work enabling, and the majority of
+tours over time. **The hard rule is read-before-answering**; the disclaimer is
+secondary. The danger is never refusal, it is a confident answer about unread
+code, which is indistinguishable from a good one until acted upon.
+
+*Considered and rejected:* having the plugin render the "did not author this
+tour" notice rather than trusting the agent to say it — machine-enforced rather
+than instruction-enforced, which this project usually prefers. Rejected because
+the caveat belongs in the agent's own voice beside its reasoning, not as chrome
+readers learn to skip. **If evals (#23) show agents omitting it, plugin-rendered
+is the known fallback.**
+
+**OQ-6 — Tiers 1 and 2 only in v1.** The in-buffer extmark spinner and the
+`winbar` cover every case where the reader is looking at the walkthrough. Tier 3
+(retitling the surface) is the only tier visible from the chat tab, but at that
+moment the agent is visibly working in front of them, so it largely duplicates
+what they can already see. It also needs a new `_title` verb calling the same
+plugin-to-CLI pattern that **#30** reports leaks state on the common exit path;
+adding a second caller to a defective pattern is the wrong order. The seam is
+named, so it is a later addition rather than a redesign.
 
 Two things this document treats as **preconditions rather than open questions**,
 flagged here so they are not missed: issue #15 (the state directory's ownership
 is unchecked, and the FIFO leans on that directory harder than the state file
-does), and moving the nvim socket out of the shared temp directory into
-`STATE_DIR` (§ 5). Both are small; neither is optional once a live channel runs
-through that directory.
+does) — **now fixed and closed** — and moving the nvim socket out of the shared
+temp directory into `STATE_DIR` (§ 5), **which is still outstanding**. Neither
+is optional once a live channel runs through that directory.
