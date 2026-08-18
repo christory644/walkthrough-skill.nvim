@@ -327,10 +327,16 @@ check "edited: ...and printed nothing"           "0" "$(printf '%s' "$e_got" | w
 # Three things make it decidable:
 #   * the reader is observed STILL RUNNING (kill -0) and its output file EMPTY
 #     immediately before the write;
-#   * its return timestamp falls AFTER the write timestamp, inside a small
-#     delta (second granularity via `date +%s` is enough for a 5s bound; no
-#     python3, per the controller ruling -- none of this repo's other tests
-#     depend on it);
+#   * it returns within 5 seconds of the write, measured across the write
+#     (second granularity via `date +%s` is enough for a 5s bound; no python3,
+#     per the controller ruling -- none of this repo's other tests depend on
+#     it). Mutation-tested: with the write removed the reader returns at its
+#     own 20s budget and this fails, 15s clear of the bound. The companion
+#     `back_at >= wrote_at` conjunct in the assertion carries NOTHING and is
+#     not claimed here: `date +%s` is non-decreasing and back_at is sampled
+#     later in program order, so nothing under test can falsify it -- it
+#     printed true under the failing mutation too. It is kept only as an
+#     ordering sanity check on the two samples;
 #   * and the control below -- the same run with NO WRITE -- must time out
 #     non-zero and print nothing. Without that control, a reader that returns
 #     empty immediately passes an "it arrived" test that only checks status.
@@ -362,7 +368,7 @@ check "P2: the reader exited 0" "0" "$rc"
 printf '%s' "$(cat "$P2/out")" | grep -q '"question":"why not a plain spawn?"'
 check "P2: it printed the question that was written" "0" "$?"
 if [ "$back_at" -ge "$wrote_at" ] && [ $((back_at - wrote_at)) -le 5 ]; then within_delta=0; else within_delta=1; fi
-check "P2: it returned AFTER the write, inside a few seconds" "0" "$within_delta"
+check "P2: it returned within 5s of the write" "0" "$within_delta"
 
 # The control that gives the above its meaning.
 mkfifo -m 600 "$P2/f2"
