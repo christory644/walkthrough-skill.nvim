@@ -40,5 +40,60 @@ T.ok(vim.fn.filereadable(SENTINEL) == 0, "no sentinel: nothing was executed")
 T.err(function() wt._answer("nonce-that-was-never-issued", "hello") end,
   "no question", "an answer to an unissued nonce is refused")
 
+-- Carried Minor from Task 6: a lone \r (not followed by \n) falls in the gap
+-- between the \11-\12 and \14-\31 ranges in the strip class and reaches a
+-- buffer line as a raw CR byte, contradicting sanitise's own doc comment.
+local cr_lines = dialog.sanitise("before\rafter")
+T.ok(not table.concat(cr_lines, "\n"):find("\r", 1, true),
+  "sanitise strips a lone CR (not just \\r\\n)")
+
 wt.close()
+
+-- P8 — code buffers stay nomodifiable while the dialog is writable, asserted on
+-- the SAME TAB at the SAME MOMENT.
+--
+-- Identical-if-broken: asserting only that the dialog is writable passes on an
+-- implementation that made everything writable.
+wt.open("tests/fixtures/two_files.tour")
+local code_buf = vim.api.nvim_get_current_buf()
+local code_tab = vim.api.nvim_get_current_tabpage()
+-- Captured by identity, not by window NUMBER: a vertical split with the
+-- default 'nosplitright' opens its new window to the LEFT, which renumbers it
+-- to window 1 and would make `vim.fn.win_getid(1)` alias the dialog window
+-- itself post-mutation -- comparing a window's width to its own width always
+-- passes, which defeats the revert-check this assertion exists to satisfy.
+local code_win = vim.api.nvim_get_current_win()
+
+dialog.open({ fifo = nil, tour = "/tmp/t.tour", step_id = "the retry", index = 1, count = 2 })
+
+T.ok(dialog.is_open(), "the dialog is open")
+T.eq(vim.api.nvim_win_get_tabpage(dialog.winid()), code_tab,
+  "the dialog is in the walkthrough's own tab, not a new one")
+T.eq(vim.bo[code_buf].modifiable, false, "the code buffer is still nomodifiable")
+T.eq(vim.bo[dialog.bufnr()].buftype, "prompt", "the dialog is a prompt buffer")
+T.eq(vim.bo[dialog.bufnr()].swapfile, false, "the dialog has no swapfile")
+
+-- Layout A: full width, at the bottom. A vertical split would halve the code
+-- window, and narration is drawn INSIDE it.
+T.eq(vim.api.nvim_win_get_width(dialog.winid()),
+  vim.api.nvim_win_get_width(code_win),
+  "the dialog is full width, so the code keeps its columns")
+
+-- Never written to disk: the transcript must not become a file an agent later
+-- reads back as instructions.
+vim.api.nvim_buf_call(dialog.bufnr(), function()
+  local ok = pcall(vim.cmd, "write " .. vim.fn.tempname())
+  T.ok(not ok, "the dialog refuses to be written to disk")
+end)
+
+dialog.append({ "agent: because a spawned process has no supervisor." }, "Normal")
+local body = vim.api.nvim_buf_get_lines(dialog.bufnr(), 0, -1, false)
+T.ok(vim.iter(body):any(function(l) return l:find("no supervisor", 1, true) end),
+  "append puts the answer in the transcript")
+
+dialog.close()
+T.ok(not dialog.is_open(), "close takes the dialog away")
+T.eq(vim.api.nvim_get_current_tabpage(), code_tab, "and leaves the reader in the tab")
+wt.close()
+
 T.done()
