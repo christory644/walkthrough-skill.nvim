@@ -271,13 +271,19 @@ cmd_list() {
   ls -1 -- "$dir"/*.tour 2>/dev/null || { echo "no tours in $dir/" >&2; exit 1; }
 }
 
-# The five values the player needs, handed over as base64 inside a vimscript
-# list and decoded in Lua. Keep this chunk free of single quotes: it lives
-# inside a vimscript single-quoted string.
+# The plugin is handed the paths it is responsible for cleaning up (#30), not
+# just the ones it needs to render. The common exit is <leader>aq, which runs
+# M.close() and then dies with its surface — it never re-enters this CLI's
+# `cmd_close`, so anything relying on `walkthrough close` leaks on the ordinary
+# case. Every value is base64: the state path can contain anything $TMPDIR does.
+#
+# $sock is a local of cmd_open, which is open_expr's only caller — bash locals
+# are dynamically scoped, so it is visible here without being passed in.
 open_expr() { # $1 = absolute tour path, $2 = handle
-  printf "luaeval('%s', ['%s','%s','%s','%s','%s'])" \
-    '(function(a) local d = vim.base64.decode vim.opt.runtimepath:append(d(a[1])) vim.env.WALKTHROUGH_HANDLE = d(a[3]) vim.env.WALKTHROUGH_BACKEND = d(a[4]) vim.env.WALKTHROUGH_CLI = d(a[5]) require("walkthrough").open(d(a[2])) return 1 end)(_A)' \
-    "$(b64 "$ROOT")" "$(b64 "$1")" "$(b64 "$2")" "$(b64 "$BACKEND")" "$(b64 "$ROOT/bin/walkthrough")"
+  printf "luaeval('%s', ['%s','%s','%s','%s','%s','%s','%s'])" \
+    '(function(a) local d = vim.base64.decode vim.opt.runtimepath:append(d(a[1])) vim.env.WALKTHROUGH_HANDLE = d(a[3]) vim.env.WALKTHROUGH_BACKEND = d(a[4]) vim.env.WALKTHROUGH_CLI = d(a[5]) vim.env.WALKTHROUGH_STATE = d(a[6]) vim.env.WALKTHROUGH_SOCKET = d(a[7]) require("walkthrough").open(d(a[2])) return 1 end)(_A)' \
+    "$(b64 "$ROOT")" "$(b64 "$1")" "$(b64 "$2")" "$(b64 "$BACKEND")" \
+    "$(b64 "$ROOT/bin/walkthrough")" "$(b64 "$STATE")" "$(b64 "$sock")"
 }
 
 cmd_open() {

@@ -45,6 +45,30 @@ local function detach_keys(buf)
   state.attached[buf] = nil
 end
 
+-- The files this nvim is responsible for, and the two moments it must remove
+-- them (#30).
+--
+-- `walkthrough close` — the CLI path — already cleaned these up, but it is the
+-- RARE path. The design intends the reader to quit from inside nvim, and that
+-- path runs M.close(), which fires `_close_surface` and dies with its surface
+-- without ever re-entering the CLI. So the leaking path was the common one, and
+-- once the dialog lands the leak includes a FIFO with no reader — precisely the
+-- object the dialog design is built to avoid.
+--
+-- Unlinking here rather than through a CLI verb is deliberate: VimLeavePre has
+-- to work for `:qa!` and for a killed surface, and a jobstart fired there is not
+-- guaranteed to outlive us. fs_unlink is synchronous and needs no process.
+--
+-- Only paths the CLI injected are touched. With no env, this does nothing at
+-- all — it is not a delete-anything primitive.
+local function session_cleanup()
+  local uv = vim.uv or vim.loop
+  for _, var in ipairs({ "WALKTHROUGH_STATE", "WALKTHROUGH_SOCKET" }) do
+    local p = vim.env[var]
+    if p and p ~= "" then pcall(uv.fs_unlink, p) end
+  end
+end
+
 local function install_autocmd()
   state.augroup = vim.api.nvim_create_augroup("Walkthrough", { clear = true })
   vim.api.nvim_create_autocmd("BufEnter", {
@@ -67,6 +91,12 @@ local function install_autocmd()
         end
       end
     end,
+  })
+  -- The exit that never reaches M.close: `:qa!`, or the surface being killed
+  -- out from under us. Unlinking is synchronous, so it completes before we go.
+  vim.api.nvim_create_autocmd("VimLeavePre", {
+    group = state.augroup,
+    callback = session_cleanup,
   })
 end
 
@@ -277,6 +307,7 @@ end
 function M.close()
   if not state.active then return end
   teardown()
+  session_cleanup()
 
   -- Close our own surface if a backend gave us one. The backend positioned it
   -- so that closing returns the user where they came from.

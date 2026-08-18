@@ -311,16 +311,19 @@ c4expr="$( cd "$REPO" && bash -c '
     set -uo pipefail
     source ./bin/walkthrough --help >/dev/null 2>&1
     BACKEND=cmux
+    STATE="/tmp/c4-state"
+    sock="/tmp/c4-sock"
     open_expr "$1" "HANDLE"
   ' _ "$c4payload" )"
 printf %s "$c4expr" | grep -q "system(" && c4leak=1 || c4leak=0
 check "C-4 no attacker text reaches the remote expression" "0" "$c4leak"
 # The quote count is the sharp version of the same claim: the expression is
-# luaeval('<chunk>', ['a','b','c','d','e']) — two quotes around the chunk plus
-# ten around the five base64 arguments, twelve in total, and not one of them
-# comes from the tour path. Any injected quote changes this number.
+# luaeval('<chunk>', ['a','b','c','d','e','f','g']) — two quotes around the
+# chunk plus fourteen around the seven base64 arguments, sixteen in total, and
+# not one of them comes from the tour path. Any injected quote changes this
+# number.
 c4quotes="$(printf %s "$c4expr" | tr -cd "'" | wc -c | tr -d ' ')"
-check "C-4 the remote expression holds exactly its own 12 quotes" "12" "$c4quotes"
+check "C-4 the remote expression holds exactly its own 16 quotes" "16" "$c4quotes"
 
 # ...and the far side gets the payload back, verbatim, as data.
 c4b64="$(printf %s "$c4payload" | base64 | tr -d '\n')"
@@ -1297,6 +1300,74 @@ ws_expect "throwaway tour outside the repository" '*/ws/repo/src/app.txt'
 # 4. no repository anywhere: the invocation directory IS the root
 ws_open "$WORK/ws/loose" "loose.tour"
 ws_expect "no repository, invocation directory is the root" '*/ws/loose/src/app.txt'
+
+# ---------------------------------------------------------------------------
+# #30 — the COMMON exit path cleans up after itself.
+#
+# <leader>aq runs M.close(), which shells out to `_close_surface` — a verb that
+# closes the surface and touches no state. `walkthrough close` cleans up, but
+# that is the RARE path; the design intends the reader to quit from inside
+# nvim. So the leaking path was the common one.
+#
+# This drives the real M.close() in a real headless nvim with the env the CLI
+# injects, rather than testing the CLI's own `close`, which was never broken.
+# ---------------------------------------------------------------------------
+LEAK="$WORK/leak"; mkdir -p "$LEAK"
+touch "$LEAK/state" "$LEAK/sock"
+cat > "$LEAK/drive.lua" <<'LUA'
+vim.opt.runtimepath:append(vim.env.WT_REPO)
+vim.env.WALKTHROUGH_STATE  = vim.env.WT_STATE
+vim.env.WALKTHROUGH_SOCKET = vim.env.WT_SOCKET
+local wt = require("walkthrough")
+-- close_surface off: this test is about the files, not the multiplexer, and
+-- there is no surface here to close.
+wt.setup({ close_surface = false })
+wt.open(vim.env.WT_TOUR)
+wt.close()
+os.exit(0)
+LUA
+( cd "$REPO" && WT_REPO="$REPO" WT_STATE="$LEAK/state" WT_SOCKET="$LEAK/sock" \
+    WT_TOUR="$REPO/tests/fixtures/two_files.tour" \
+    nvim --headless --clean -l "$LEAK/drive.lua" >/dev/null 2>&1 )
+if [ -e "$LEAK/state" ]; then leak_rc=0; else leak_rc=1; fi
+check "M.close removes the state file" "1" "$leak_rc"
+if [ -e "$LEAK/sock" ]; then leak_rc=0; else leak_rc=1; fi
+check "M.close removes the socket" "1" "$leak_rc"
+
+# ...and the same on the path M.close never runs at all: :qa!, a killed surface.
+touch "$LEAK/state2" "$LEAK/sock2"
+cat > "$LEAK/quit.lua" <<'LUA'
+vim.opt.runtimepath:append(vim.env.WT_REPO)
+vim.env.WALKTHROUGH_STATE  = vim.env.WT_STATE
+vim.env.WALKTHROUGH_SOCKET = vim.env.WT_SOCKET
+local wt = require("walkthrough")
+wt.setup({ close_surface = false })
+wt.open(vim.env.WT_TOUR)
+vim.cmd("qa!")
+LUA
+( cd "$REPO" && WT_REPO="$REPO" WT_STATE="$LEAK/state2" WT_SOCKET="$LEAK/sock2" \
+    WT_TOUR="$REPO/tests/fixtures/two_files.tour" \
+    nvim --headless --clean -l "$LEAK/quit.lua" >/dev/null 2>&1 )
+if [ -e "$LEAK/state2" ]; then leak_rc=0; else leak_rc=1; fi
+check "VimLeavePre removes the state file on :qa!" "1" "$leak_rc"
+if [ -e "$LEAK/sock2" ]; then leak_rc=0; else leak_rc=1; fi
+check "VimLeavePre removes the socket on :qa!" "1" "$leak_rc"
+
+# The guard that keeps this from becoming a delete-anything primitive: with no
+# env injected, nothing is unlinked.
+touch "$LEAK/bystander"
+cat > "$LEAK/noenv.lua" <<'LUA'
+vim.opt.runtimepath:append(vim.env.WT_REPO)
+local wt = require("walkthrough")
+wt.setup({ close_surface = false })
+wt.open(vim.env.WT_TOUR)
+wt.close()
+os.exit(0)
+LUA
+( cd "$REPO" && WT_REPO="$REPO" WT_TOUR="$REPO/tests/fixtures/two_files.tour" \
+    nvim --headless --clean -l "$LEAK/noenv.lua" >/dev/null 2>&1 )
+if [ -e "$LEAK/bystander" ]; then leak_rc=0; else leak_rc=1; fi
+check "with no env injected, nothing is unlinked" "0" "$leak_rc"
 
 # Say which it was, out loud. This printed the PASSED line or nothing at all,
 # so a failing run looked like a run whose tail had scrolled — and a reader
