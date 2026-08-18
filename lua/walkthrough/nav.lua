@@ -210,16 +210,38 @@ end
 -- through `nvim_win_set_buf` rather than through `:buffer`, so the reader's
 -- focus never moves at all: a step driven from the agent's side updates the code
 -- window without taking the cursor out of the line they are typing in.
-local function code_window()
+-- Which of the OTHER windows gets the code is not "the first one nvim lists".
+-- That took whatever sat at the top-left, and this plugin PUTS something there:
+-- `:copen` is the tour's own table of contents, which is why `is_our_qflist`
+-- exists at all. A reader with the quickfix list open -- the documented way to
+-- see the whole tour -- had the step drawn over their list, cursor parked in it,
+-- while the real code window still showed the previous step. Any left/top
+-- sidebar (a file tree) is the same shape.
+--
+-- Preference, strongest evidence first:
+--   1. a window already showing a buffer THIS walkthrough has drawn in. That is
+--      not a heuristic about window kinds, it is the code window by identity --
+--      `state.touched` is the record of every buffer a step was rendered into.
+--   2. any ordinary file window (`buftype == ""`). Quickfix, help, terminals and
+--      the `nofile` buffers every file-tree plugin uses all name themselves out
+--      of this, and a step belongs in a window that holds files.
+--   3. nothing suitable: split, below.
+local function code_window(state)
   local ok, dialog = pcall(require, "walkthrough.dialog")
   local dwin = (ok and dialog.is_open()) and dialog.winid() or nil
   local cur = vim.api.nvim_get_current_win()
   if cur ~= dwin then return cur end
-  for _, w in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
-    if w ~= dwin then return w end
+  local wins = vim.api.nvim_tabpage_list_wins(0)
+  local touched = (state and state.touched) or {}
+  for _, w in ipairs(wins) do
+    if w ~= dwin and touched[vim.api.nvim_win_get_buf(w)] then return w end
   end
-  -- The dialog is the only window left (`:only` from inside it). Make somewhere
-  -- for the code to go rather than taking the dialog's window by force.
+  for _, w in ipairs(wins) do
+    if w ~= dwin and vim.bo[vim.api.nvim_win_get_buf(w)].buftype == "" then return w end
+  end
+  -- No window is fit to hold code: the dialog is alone in the tab (`:only` from
+  -- inside it), or everything else is a sidebar. Make somewhere for the code to
+  -- go rather than taking one of those windows by force.
   local made
   vim.api.nvim_win_call(dwin, function()
     vim.cmd("aboveleft split")
@@ -260,7 +282,7 @@ function M.goto_index(state, i)
     elseif not line then
       M.demote(state, t, target, unresolved(t, target, bufnr))
     else
-      local win = code_window()
+      local win = code_window(state)
       if vim.api.nvim_win_get_buf(win) ~= bufnr then
         vim.api.nvim_win_set_buf(win, bufnr)
       end

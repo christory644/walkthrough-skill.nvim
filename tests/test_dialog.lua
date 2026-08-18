@@ -482,6 +482,44 @@ T.ok(not vim.iter(vim.api.nvim_buf_get_keymap(vim.api.nvim_get_current_buf(), "n
   "the dismiss key is never bound on a code buffer")
 wt.close()
 
+-- Re-review, regression 1 — the step must not be drawn into a window that is
+-- not a code window. `code_window` returned the first window in tabpage order
+-- that was not the dialog, and this plugin PUTS something at the top-left: the
+-- quickfix list is the tour's own table of contents (`:copen` is in the README's
+-- key table, and `nav.is_our_qflist` exists because readers have it open). With
+-- the list open and the reader in the dialog, `walkthrough step +1` drew the
+-- step over the LIST and parked the cursor in it, while the code window still
+-- showed the previous step. A file-tree sidebar is the same shape.
+--
+-- Identical-if-broken: asserting only that the code window ends up on beta.txt
+-- would pass on a build that ALSO scribbled on the quickfix window, so both
+-- windows are asserted -- the one that must change, and the one that must not.
+-- One window to start from: the blocks above deliberately leave orphaned
+-- windows still showing tour buffers, and with two equally valid code windows
+-- this assertion would be about which one nav happened to pick rather than
+-- about the quickfix window it must not pick.
+vim.cmd("only")
+wt.open("tests/fixtures/two_files.tour")
+local qf_code_win = vim.api.nvim_get_current_win()
+vim.cmd("topleft copen")
+local qf_win = vim.api.nvim_get_current_win()
+local qf_buf = vim.api.nvim_win_get_buf(qf_win)
+T.eq(vim.bo[qf_buf].buftype, "quickfix", "the tour's table of contents is open")
+vim.api.nvim_set_current_win(qf_code_win)
+wt.ask()                                  -- the reader is now in the dialog
+T.eq(vim.api.nvim_get_current_win(), dialog.winid(), "...and the dialog has the focus")
+wt.step(1)                                -- the agent's `walkthrough step +1`
+T.eq(vim.api.nvim_win_get_buf(qf_win), qf_buf,
+  "the quickfix window still holds the quickfix list, not the step")
+T.eq(vim.bo[vim.api.nvim_win_get_buf(qf_win)].buftype, "quickfix",
+  "...and it is still a quickfix window")
+T.ok(win_file(qf_code_win):find("beta.txt", 1, true) ~= nil,
+  "...the step landed in the code window")
+T.eq(vim.api.nvim_win_get_buf(dialog.winid()), dialog.bufnr(),
+  "...and the dialog still shows the transcript")
+vim.cmd("cclose")
+wt.close()
+
 -- ---------------------------------------------------------------------------
 -- F3 (Important) — two questions in flight.
 --
