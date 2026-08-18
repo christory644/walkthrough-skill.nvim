@@ -40,17 +40,21 @@ if [ $((t1 - t0)) -le 8 ]; then within_budget=0; else within_budget=1; fi
 check "no question: returns inside its budget" "0" "$within_budget"
 
 # ---------------------------------------------------------------------------
-# THE REGRESSION THAT MATTERS (Measurement E).
+# Delivery while a reader is attached.
 #
-# A reader that holds the FIFO O_RDWR — which is what bash's `exec 3<>fifo`
-# does, and the obvious way to bound a read in portable shell — measures as NO
-# READER from the writer's side: the writer's O_WRONLY|O_NONBLOCK open returns
-# ENXIO while that reader is attached and waiting. Every question would be
-# refused while an agent was listening.
+# This asserts the property directly: while await's reader is up, a
+# non-blocking writer's open must SUCCEED and the write must be delivered.
+# That is the whole mechanism the transport depends on.
 #
-# So this asserts the property directly: while await's reader is up, a
-# non-blocking writer's open must SUCCEED. If anyone ever "simplifies"
-# await.lua to `exec 3<>`, this is what fails.
+# NOT a regression guard against `exec 3<>fifo`: an earlier version of this
+# comment claimed an O_RDWR reader (what `exec 3<>fifo` produces) measures as
+# no reader to the writer, so this test would catch a "simplification" to
+# that spelling. Tested directly and that claim was wrong — an O_RDWR reader
+# is also seen as a reader here, in bash, in nvim, and via a raw open(2). This
+# test still checks a real, necessary property (see await.lua's own header
+# comment for why O_RDONLY|O_NONBLOCK is used anyway), but it does not
+# distinguish that implementation from an O_RDWR one, and must not be read as
+# proof against it.
 # ---------------------------------------------------------------------------
 cat > "$WORK/try-open.lua" <<'LUA'
 local uv = vim.uv or vim.loop
@@ -67,7 +71,7 @@ kill -0 "$RPID" 2>/dev/null; check "reader is still running before the write" "0
 check "reader has printed nothing before the write" "0" "$(wc -c < "$WORK/q1" | tr -d ' ')"
 opened="$(nvim --headless --clean -l "$WORK/try-open.lua" "$FIFO" '{"question":"why"}
 ')"
-check "a non-blocking writer sees await's reader" "OPENED" "$opened"
+check "a non-blocking writer can deliver to await's reader" "OPENED" "$opened"
 wait "$RPID"; check "reader exits 0 once a question arrives" "0" "$?"
 check "reader printed the question verbatim" '{"question":"why"}' "$(cat "$WORK/q1")"
 

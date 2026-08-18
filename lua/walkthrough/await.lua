@@ -3,24 +3,31 @@
 --
 -- Argv only, like validate.lua: the FIFO path is data and never source.
 --
--- Why this is a Lua script and not `timeout N head -1 < fifo`:
+-- Why this is a Lua script and not `timeout N head -1 < fifo`: macOS has no
+-- timeout(1), so a bounded read is not spellable in portable shell at all.
+-- That is reason enough on its own.
 --
---   1. macOS has no timeout(1), so that spelling is not portable at all; and
---   2. the obvious portable substitute — bash's `exec 3<>fifo` plus `read -t` —
---      opens the FIFO O_RDWR, and a O_RDWR holder MEASURES AS NO READER from
---      the writer's side. nvim's O_WRONLY|O_NONBLOCK open returns ENXIO while
---      that reader is attached and waiting, so every question would be refused
---      while an agent was listening. Measured on the reference machine;
---      tests/test_dialog_fifo.sh pins it.
+-- O_RDONLY|O_NONBLOCK is used because the open returns immediately rather
+-- than blocking until a writer shows up — which is exactly the block a
+-- timeout would otherwise be needed to bound. (An O_RDWR open, the shape
+-- `exec 3<>fifo` produces, also counts as a reader to a writer's
+-- O_WRONLY|O_NONBLOCK open — tested directly, on this machine, in bash, in
+-- nvim, and via a raw open(2); an earlier version of this comment claimed
+-- the opposite and was wrong. So O_RDONLY|O_NONBLOCK is not the only shape
+-- that works here — it is simply the simpler correct one, and the one that
+-- does not also hold this process open as a writer on its own FIFO.)
 --
--- O_RDONLY|O_NONBLOCK is the only shape that both returns immediately (rather
--- than blocking in open() until a writer shows up, which is what would need the
--- timeout we cannot spell) AND counts as a reader for the writer's ENXIO check.
---
--- One more rule, and it is the reason a bare EOF is not a question: a writer
--- that opens and closes WITHOUT writing ends a blocked reader with an empty,
--- SUCCESSFUL read. Only a complete newline-terminated line counts here. A
--- partial read is held and waited on; nothing else is ever printed.
+-- What a Lua reader buys over `head -1 < fifo` that is worth the extra file:
+-- exact budget control (the while-loop below, not a wrapper process), and
+-- surviving a stray open-close-without-write. Measured both ways: a bare
+-- probe (open, no write, close) ends `head -1 < fifo` with rc=0 and zero
+-- bytes — indistinguishable from "someone asked nothing" — while this
+-- script's read of that same probe comes back as 0 bytes with NO error
+-- (see the EOF-vs-error branch below), so the loop just keeps waiting and
+-- still delivers the next real question whole. That is the reason a bare
+-- EOF is not treated as a question here: only a complete newline-terminated
+-- line counts. A partial read is held and waited on; nothing else is ever
+-- printed.
 local uv = vim.uv or vim.loop
 
 local path = _G.arg[1]
