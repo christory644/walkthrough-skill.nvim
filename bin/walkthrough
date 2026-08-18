@@ -514,6 +514,39 @@ cmd_close() {
   return "$rc"
 }
 
+# `await` hides the transport, on purpose. Teaching SKILL.md to run
+# `head -1 < $FIFO` would weld the mechanism into a file that cannot be changed
+# without re-teaching every installed agent; behind a verb, the transport is one
+# function here (docs/dialog-design.md § Decisions, OQ-1).
+#
+# The default budget is 90s because the agent runs this inside a tool call and
+# the common harness default for one is 120s. A longer default would be killed
+# by the harness instead of returning its own honest "nobody asked", and a
+# killed call tells the agent nothing.
+cmd_await() {
+  local budget=90
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --timeout)
+        shift; budget="${1:-}"
+        [[ "$budget" =~ ^[0-9]+$ ]] || die "await --timeout takes whole seconds (got: $budget)"
+        [ "$budget" -ge 1 ] && [ "$budget" -le 3600 ] \
+          || die "await --timeout must be between 1 and 3600 seconds (got: $budget)"
+        ;;
+      *) die "await takes --timeout <seconds> (got: $1)" ;;
+    esac
+    shift
+  done
+  with_state
+  [ -n "$ST_dialog" ] \
+    || die "this walkthrough has no dialog channel (reopen it with this CLI)"
+  [ -p "$ST_dialog" ] || die "the dialog channel is missing: $ST_dialog"
+  # -l propagates the script's exit status, so 4 ("nobody asked") reaches the
+  # agent as 4 rather than as a generic failure.
+  nvim --headless --clean -l "$ROOT/lua/walkthrough/await.lua" \
+    "$ST_dialog" "$((budget * 1000))"
+}
+
 usage() {
   cat <<'EOF'
 walkthrough — play guided code tours in nvim
@@ -522,6 +555,8 @@ walkthrough — play guided code tours in nvim
   walkthrough step <+1|-1|N>       move along the narrative
   walkthrough reload [tour.tour]   re-render after files changed on disk
   walkthrough close                end the walkthrough
+  walkthrough await [--timeout N]  wait for a question from the walkthrough
+                                   (exit 4 = nobody asked; default 90s)
   walkthrough list [dir]           list tours (default: <workspace root>/.tours/)
   walkthrough validate <tour>...   exit 0 only if every tour is playable,
                                    reporting the line each pattern resolved to
@@ -550,6 +585,7 @@ case "${1:-}" in
   step) shift; cmd_step "$@" ;;
   reload) shift; cmd_reload "$@" ;;
   close) shift; cmd_close "$@" ;;
+  await) shift; cmd_await "$@" ;;
   list) shift; cmd_list "$@" ;;
   validate) shift; cmd_validate "$@" ;;
   schema) cmd_schema ;;
