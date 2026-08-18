@@ -144,6 +144,7 @@ Once a walkthrough is open, in nvim:
 |---|---|
 | `]w` / `[w` | next / previous step |
 | `<leader>an` / `<leader>ap` | next / previous step |
+| `<leader>aa` | ask about this step |
 | `<leader>aq` | end the walkthrough |
 | `:copen` | the whole tour as a list |
 

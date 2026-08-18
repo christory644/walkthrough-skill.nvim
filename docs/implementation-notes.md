@@ -124,6 +124,42 @@ the previous walkthrough back (on the same step) if the new one will not open.
 60 measured at ~1.8 s of wall clock, which is shorter than a cold nvim start
 with a real configuration.
 
+**`walkthrough await` is an `nvim -l` reader, not `timeout N head -1 < fifo`.**
+Issue #21 and `docs/design.md` both describe the `head` shape. It is wrong on
+macOS twice over: there is no `timeout(1)`, and the portable bash substitute —
+`exec 3<>fifo` plus `read -t` — opens the FIFO **O_RDWR**, which measures as *no
+reader* from the writer's side. The plugin's `O_WRONLY|O_NONBLOCK` open returns
+`ENXIO` while that reader is attached and waiting, so every question would be
+refused while an agent was listening. Only `O_RDONLY|O_NONBLOCK` both returns
+immediately and counts as a reader. `tests/test_dialog_fifo.sh` pins it; the
+agent never sees the difference, because the transport is behind the verb.
+
+**Nothing probes the dialog FIFO for liveness.** An open that closes without
+writing ends a blocked reader with an empty, *successful* read — measured. So a
+"is anyone listening?" call would silently end the agent's turn with no question
+in it. The only reason to open that FIFO is to write immediately. This is why
+OQ-3's auto-send retry tick *is* a send attempt, and why its "beat to cancel" is
+a standing notice for the whole pending window rather than a countdown after a
+reader is detected.
+
+**The dialog buffer is not in `state.touched`.** `docs/dialog-design.md` § 3
+says it should be, so that `teardown` finds it. It is closed explicitly instead,
+from `teardown` and from `M.reload`, because `reload` runs `silent! edit!` over
+every buffer in `state.touched` — wrong for a `buftype=prompt` buffer, and it
+would destroy a transcript the reload was very likely caused by. An answer that
+rewrites the tour goes through `reload`; the dialog has to survive it.
+
+**A socket path over 104 characters is refused, not truncated.** Past that
+length, nvim silently truncates the path to fit `sun_path` and binds the socket
+somewhere else — dropping the last path component — while still reporting the
+path it was given as `v:servername`. RPC connects either way, so it looks like
+success from every angle except the one that matters: the socket would not
+actually be inside `STATE_DIR`, whose ownership `cmd_open` checked, and `close`
+would `rm -f` a path that deletes nothing. `cmd_open` measures `${#sock}`
+against 104 (macOS's `sun_path` limit; Linux allows 108, so 104 is the portable
+bound) before ever calling nvim, and dies with the path and a suggestion to set
+a shorter `$XDG_RUNTIME_DIR` rather than let the mismatch happen silently.
+
 ## Verified, not assumed
 
 Two claims the plan makes as reasoning were later measured, and both hold: a
