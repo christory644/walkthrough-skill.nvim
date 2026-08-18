@@ -71,10 +71,16 @@ jobs:
       # the harder thing to test honestly (docs/dialog-design.md, OQ-1), so the
       # controls are not optional.
       #
-      # It also pins the one platform fact the whole design rests on: a reader
-      # holding the FIFO O_RDWR measures as NO READER from the writer's side, so
-      # await.lua must open O_RDONLY|O_NONBLOCK. That is measured here on Linux
-      # as well as on the macOS reference machine.
+      # It also pins the platform fact the transport actually depends on: while
+      # await's O_RDONLY|O_NONBLOCK reader is attached, a non-blocking writer's
+      # open succeeds and the write is delivered. (An earlier version of this
+      # comment claimed an O_RDWR reader — what `exec 3<>fifo` produces — reads
+      # as NO reader to the writer. That was tested and is false: O_RDWR counts
+      # as a reader too, here, in bash, in nvim, and via a raw open(2). This
+      # test does not distinguish the two shapes and must not be read as a
+      # regression guard for the withdrawn claim — see await.lua's own header
+      # for why O_RDONLY|O_NONBLOCK is used anyway.) Measured here on Linux as
+      # well as on the macOS reference machine.
       - name: dialog transport
         run: ./tests/test_dialog_fifo.sh
       # The skill bundle and the installer. install.sh is the first command

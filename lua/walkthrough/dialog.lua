@@ -261,10 +261,15 @@ local function next_nonce()
   return string.format("%x-%d", (vim.uv or vim.loop).hrtime(), S.seq)
 end
 
--- The retry interval. Each tick is a full send ATTEMPT, not a probe: there is
--- no way to ask "is anyone listening?" without an open, and an open that does
--- not write ends the agent's read with an empty, successful result. A refused
--- attempt costs an ENXIO at 0.03 ms, so a one-second tick is free.
+-- The retry interval. Each tick is a full send ATTEMPT, not a probe:
+-- O_WRONLY|O_NONBLOCK makes the liveness check and the write the same
+-- syscall, so a separate "is anyone listening?" open would be a second fact
+-- that can only disagree with the attempt itself — it buys nothing over just
+-- trying. (It would also cost something against a naive one-shot reader: an
+-- open that closes without writing ends a blocked `head -1 < fifo` with an
+-- empty, successful read — measured — though not our own O_RDONLY|O_NONBLOCK
+-- reader, which tolerates it.) A refused attempt costs an ENXIO at 0.03 ms,
+-- so a one-second tick is free.
 M.RETRY_MS = 1000
 -- After ten minutes nobody is coming. The text stays in the prompt line; only
 -- the timer stops. A question that lands after the reader has forgotten it is

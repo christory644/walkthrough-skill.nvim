@@ -14,11 +14,16 @@
 --
 -- Two rules follow, and both are load-bearing:
 --
---   * There is NO liveness probe anywhere in this plugin. An open that closes
---     without writing ends a blocked reader with an empty, SUCCESSFUL read
---     (measured), so a "is anyone listening?" call would silently end the
---     agent's turn with no question in it. The only reason to open this FIFO is
---     to write, immediately, and close.
+--   * There is NO liveness probe anywhere in this plugin. Not because a probe
+--     would break our reader — it does not (see await.lua) — but because a
+--     probe buys nothing: the open above already IS the liveness check, so a
+--     second one is a second fact that can only disagree with the first. The
+--     only reason to open this FIFO is to write, immediately, and close.
+--     (A probe would still be unsafe to reintroduce against a naive one-shot
+--     reader: an open that closes without writing ends a blocked
+--     `head -1 < fifo` with an empty, SUCCESSFUL read — measured — which is a
+--     reason not to build one, even though it is not the reason this plugin
+--     has none.)
 --   * A short write is REPORTED, never retried. Retrying is how a non-blocking
 --     writer talks itself back into blocking.
 local uv = vim.uv or vim.loop
