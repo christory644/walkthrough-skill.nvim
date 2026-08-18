@@ -125,22 +125,34 @@ the previous walkthrough back (on the same step) if the new one will not open.
 with a real configuration.
 
 **`walkthrough await` is an `nvim -l` reader, not `timeout N head -1 < fifo`.**
-Issue #21 and `docs/design.md` both describe the `head` shape. It is wrong on
-macOS twice over: there is no `timeout(1)`, and the portable bash substitute —
-`exec 3<>fifo` plus `read -t` — opens the FIFO **O_RDWR**, which measures as *no
-reader* from the writer's side. The plugin's `O_WRONLY|O_NONBLOCK` open returns
-`ENXIO` while that reader is attached and waiting, so every question would be
-refused while an agent was listening. Only `O_RDONLY|O_NONBLOCK` both returns
-immediately and counts as a reader. `tests/test_dialog_fifo.sh` pins it; the
-agent never sees the difference, because the transport is behind the verb.
+Issue #21 and `docs/design.md` both describe the `head` shape. The reason it is
+wrong is **macOS has no `timeout(1)`**, so a bounded read is not spellable in
+portable shell — that is sufficient on its own. A Lua reader also buys exact
+budget control and survives a stray open-close-without-write, which `head -1`
+does not.
 
-**Nothing probes the dialog FIFO for liveness.** An open that closes without
-writing ends a blocked reader with an empty, *successful* read — measured. So a
-"is anyone listening?" call would silently end the agent's turn with no question
-in it. The only reason to open that FIFO is to write immediately. This is why
-OQ-3's auto-send retry tick *is* a send attempt, and why its "beat to cancel" is
-a standing notice for the whole pending window rather than a countdown after a
-reader is detected.
+*An earlier draft of this note gave a second reason: that bash's `exec 3<>fifo`
+opens the FIFO `O_RDWR` and therefore measures as no reader to a non-blocking
+writer. **That was measured during this build and is false** — an `O_RDWR`
+holder does count as a reader, verified in bash, in nvim, and via a raw open.
+The claim is recorded here only so nobody reinstates it.* `O_RDONLY|O_NONBLOCK`
+remains the right choice because it returns immediately rather than blocking in
+`open()` until a writer appears, and because it does not also hold the reader
+open as a writer on its own FIFO — not because it is the only shape that works.
+
+**Nothing probes the dialog FIFO for liveness.** The reason is that a probe
+**buys nothing**: `O_WRONLY|O_NONBLOCK` makes liveness and delivery the same
+syscall — the open either is `ENXIO` or is the write — so a separate probe is a
+second fact that can disagree with the first. This is why OQ-3's auto-send retry
+tick *is* a send attempt.
+
+*A bare probe does end a `head -1 < fifo` reader with an empty, successful read
+— measured — but it does **not** end `await.lua`, which keeps waiting and still
+delivers the next real question whole. So "a probe would break our reader" is
+not the justification; the one above is. It also means OQ-3's "beat to cancel"
+could have been a literal countdown; the standing notice is a choice (the whole
+pending window is cancellable, and no probe means nothing to disagree with the
+send), not something physics forced.*
 
 **The dialog buffer is not in `state.touched`.** `docs/dialog-design.md` § 3
 says it should be, so that `teardown` finds it. It is closed explicitly instead,
