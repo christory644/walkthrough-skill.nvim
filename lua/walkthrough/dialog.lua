@@ -168,7 +168,16 @@ function M.submit(text)
   local ok, reason, message = channel.send(ctx.fifo, payload)
   if ok then
     M.issued[nonce] = { step = ctx.step_id, index = ctx.index, answered = false }
-    M.append({ "you: " .. text }, nil)
+    -- text is allowed to contain \n (the control-char guard above deliberately
+    -- lets \n and \t through), and nvim_buf_set_lines refuses any array element
+    -- that embeds a newline -- an unsanitised "you: " .. text raises "'replacement
+    -- string' item contains newlines" for a multi-line question, AFTER the send
+    -- already succeeded and the nonce is already recorded. Route through
+    -- M.sanitise, exactly as M.answer does, so the echo is one buffer line per
+    -- source line, same as the transcript for an agent's answer.
+    local echo = M.sanitise(text)
+    echo[1] = "you: " .. echo[1]
+    M.append(echo, nil)
     M.on_sent(nonce)
     return true, nonce
   end

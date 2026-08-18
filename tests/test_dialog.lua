@@ -5,6 +5,7 @@ T.load_plugin()
 
 local wt = require("walkthrough")
 local dialog = require("walkthrough.dialog")
+local channel = require("walkthrough.channel")
 
 local SENTINEL = vim.fn.tempname() .. "-pwned"
 
@@ -90,6 +91,34 @@ dialog.append({ "agent: because a spawned process has no supervisor." }, "Normal
 local body = vim.api.nvim_buf_get_lines(dialog.bufnr(), 0, -1, false)
 T.ok(vim.iter(body):any(function(l) return l:find("no supervisor", 1, true) end),
   "append puts the answer in the transcript")
+
+-- Important, review round 1: M.submit's success echo used to concatenate an
+-- UNSANITISED question straight into one nvim_buf_set_lines element ("you: "
+-- .. text). The control-char guard in M.submit deliberately lets \n and \t
+-- through (a question is allowed to be multi-line), and nvim_buf_set_lines
+-- refuses any element that embeds a newline -- so a multi-line question threw
+-- 'replacement string' item contains newlines, AFTER channel.send had already
+-- succeeded and the nonce was already recorded in M.issued. Not reachable by
+-- typing at the prompt (a buffer line cannot contain \n) but M.submit is a
+-- public interface, and Task 9's auto-send calls it programmatically.
+--
+-- channel.send is stubbed here rather than routed through a real FIFO: the
+-- defect and its fix live entirely in the echo path, not the transport, and a
+-- stub keeps this assertion synchronous and process-free.
+local real_send = channel.send
+channel.send = function(_path, _payload) return true end
+local ok, sent, nonce = pcall(function() return dialog.submit("line one\nline two") end)
+channel.send = real_send
+
+T.ok(ok, "submit with an embedded newline does not raise: " .. tostring(sent))
+T.eq(sent, true, "...and still reports success")
+T.ok(type(nonce) == "string" and #nonce > 0, "...with a nonce")
+
+local echoed = table.concat(vim.api.nvim_buf_get_lines(dialog.bufnr(), 0, -1, false), "\n")
+T.ok(echoed:find("you: line one", 1, true) ~= nil,
+  "...the echoed first line keeps the you: prefix")
+T.ok(echoed:find("\nline two", 1, true) ~= nil,
+  "...and the second line survives as its own transcript line, text intact")
 
 dialog.close()
 T.ok(not dialog.is_open(), "close takes the dialog away")
