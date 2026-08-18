@@ -520,6 +520,46 @@ T.eq(vim.api.nvim_win_get_buf(dialog.winid()), dialog.bufnr(),
 vim.cmd("cclose")
 wt.close()
 
+-- Re-review, regression 2 — `dialog_close` bindings must not accumulate.
+--
+-- The dialog's buffer is reused across a dismissal, and attach_dialog only ever
+-- SET the binding: a default open then a rebind left both keys live, and `""`
+-- (this key table's documented way to disable a binding) disabled nothing --
+-- the old key still dismissed. Asserted on a REUSED buffer for exactly that
+-- reason: a fresh buffer passes either way, so the fresh-buffer assertions
+-- earlier in this file cannot catch it.
+require("walkthrough").setup({ keys = { dialog_close = "q" } })
+wt.open("tests/fixtures/two_files.tour")
+wt.ask()
+local reused = dialog.bufnr()
+local dismiss_keys = function()
+  local out = {}
+  for _, m in ipairs(vim.api.nvim_buf_get_keymap(reused, "n")) do
+    if tostring(m.desc or ""):find("dismiss the dialog", 1, true) then
+      table.insert(out, m.lhs)
+    end
+  end
+  table.sort(out)
+  return out
+end
+local redismiss = function()
+  vim.api.nvim_set_current_win(dialog.winid())
+  vim.cmd("quit")
+end
+T.eq(dismiss_keys(), { "q" }, "the default binding is on the dialog buffer")
+redismiss()
+require("walkthrough").setup({ keys = { dialog_close = "Z" } })
+wt.ask()
+T.eq(dialog.bufnr(), reused, "the reopened dialog is the same, reused buffer")
+T.eq(dismiss_keys(), { "Z" }, "rebinding REPLACES the old key rather than adding to it")
+redismiss()
+require("walkthrough").setup({ keys = { dialog_close = "" } })
+wt.ask()
+T.eq(dialog.bufnr(), reused, "...still the same buffer")
+T.eq(dismiss_keys(), {}, '...and "" really leaves nothing bound')
+wt.close()
+require("walkthrough").setup({ keys = { dialog_close = "q" } })
+
 -- ---------------------------------------------------------------------------
 -- F3 (Important) — two questions in flight.
 --

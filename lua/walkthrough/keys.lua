@@ -43,11 +43,29 @@ end
 -- The dialog's own buffer-local bindings. Separate from M.attach because the
 -- dialog is not a tour buffer: it must never carry the step keys (they would
 -- fight the prompt) and it must never enter state.touched.
+--
+-- The binding is REPLACED on every open, not added to. The dialog's buffer
+-- survives a dismissal and is reused by the next open (that is what keeps the
+-- transcript), so setting without clearing accumulated every key the reader had
+-- ever configured -- default `q`, then `Z`, and both still live -- and `""`,
+-- which this key table documents as the way to disable any binding, disabled
+-- nothing at all: the buffer it would have had no binding on was never built.
+--
+-- What was really bound is recorded ON the buffer rather than recomputed from
+-- config, the same discipline `state.attached` keeps for tour buffers: config
+-- can change between the bind and the unbind, and the unbind has to remove what
+-- is actually there.
 function M.attach_dialog(bufnr, keys)
+  local prior = vim.b[bufnr].walkthrough_dialog_key
+  if type(prior) == "string" and prior ~= "" then
+    pcall(vim.keymap.del, "n", prior, { buffer = bufnr })
+  end
+  vim.b[bufnr].walkthrough_dialog_key = nil
   local lhs = keys.dialog_close
   if not lhs or lhs == "" then return end
   vim.keymap.set("n", lhs, function() require("walkthrough.dialog").dismiss() end,
     { buffer = bufnr, silent = true, desc = "walkthrough: dismiss the dialog" })
+  vim.b[bufnr].walkthrough_dialog_key = lhs
 end
 
 function M.detach(bufnr, keys)
