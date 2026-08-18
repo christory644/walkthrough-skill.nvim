@@ -378,7 +378,7 @@ cmd_open() {
   # The player is pinned to the same workspace root everything above resolved
   # against — see wt_nvim_cmd.
   handle="$(backend_open "$(wt_nvim_cmd "$wsroot" "$sock" ${files_arr[@]+"${files_arr[@]}"})")" \
-    || die "backend failed to open a surface"
+    || { rm -f "$fifo"; die "backend failed to open a surface"; }
 
   # Readiness is the socket, never the shell prompt. 300 tries (~9s) matches
   # the measured worst-case nvim startup time (Task 7); do not lower it.

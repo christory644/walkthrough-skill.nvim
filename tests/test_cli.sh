@@ -382,10 +382,39 @@ printf '%s\n' "$open_body" | grep -q 'mkfifo' \
 printf '%s\n' "$open_body" | grep -q 'fifo="\$STATE_DIR/dialog-\$\$\.fifo"' \
   ; check "the FIFO lives in STATE_DIR, named for this CLI's pid" "0" "$?"
 
-# ...and cmd_close must take it away, as a backstop to the plugin.
-close_body="$(sed -n '/^cmd_close()/,/^}/p' "$REPO/bin/walkthrough" | grep -v '^ *#')"
-printf '%s\n' "$close_body" | grep -q 'ST_dialog' \
-  ; check "cmd_close removes the dialog FIFO" "0" "$?"
+# Every exit reachable after mkfifo must remove the FIFO, not just the two
+# the brief happened to enumerate (wt_wait_for_socket, --remote-expr).
+# backend_open's failure arm is a third, and it is exercised for real here:
+# the tmux backend is forced with $TMUX unset, which fails backend_open
+# inside cmd_open AFTER the FIFO already exists. Without a cleanup on that
+# arm the FIFO is left behind permanently — nvim never started, so the
+# plugin's session_cleanup (which only runs inside a live nvim) never gets a
+# chance to remove it either.
+dfifo_before="$(find "$XDG_RUNTIME_DIR/walkthrough-${USER:-x}" -name 'dialog-*.fifo' 2>/dev/null | wc -l | tr -d ' ')"
+( cd "$REPO" && env -u TMUX WALKTHROUGH_BACKEND=tmux "$WT" open tests/fixtures/two_files.tour ) >/dev/null 2>&1
+dfifo_rc=$?
+check "a failed backend_open exits non-zero" "1" "$dfifo_rc"
+dfifo_after="$(find "$XDG_RUNTIME_DIR/walkthrough-${USER:-x}" -name 'dialog-*.fifo' 2>/dev/null | wc -l | tr -d ' ')"
+check "...and a failed backend_open leaves no FIFO behind" "$dfifo_before" "$dfifo_after"
+
+# ...and cmd_close must take it away, as a backstop to the plugin. This runs
+# cmd_close for real, against a real FIFO on disk, and stats the result — a
+# grep for the string 'ST_dialog' in cmd_close's body proves the identifier
+# is MENTIONED, not that anything is removed: a mutation that kept the
+# identifier in an unrelated real line, while dropping it from the `rm -f`,
+# defeated that check outright.
+dialog_fifo="$WORK/close-dialog.fifo"
+mkfifo -m 600 "$dialog_fifo"
+plant_state cmux close-fifo-handle "$WORK/dead.sock" "$WORK/t.tour" "$dialog_fifo"
+( cd "$REPO" && REPO="$REPO" bash -c '
+    set -uo pipefail
+    source "$REPO/bin/walkthrough" --help >/dev/null 2>&1
+    load_backend()  { BACKEND=stub; }
+    backend_close() { return 0; }
+    cmd_close
+  ' _ ) >/dev/null 2>&1
+[ -e "$dialog_fifo" ] && dialog_left=1 || dialog_left=0
+check "cmd_close removes the dialog FIFO" "0" "$dialog_left"
 
 # ---------------------------------------------------------------------------
 # I-3 — the step argument is an integer or it is refused
