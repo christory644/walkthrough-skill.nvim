@@ -13,7 +13,14 @@ check() { if [ "$2" = "$3" ]; then echo "  ok: $1"; else echo "  FAIL: $1 (want 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/walkthrough-test.XXXXXX")" || exit 1
 # Point the CLI's state directory at $WORK too, so the suite can never disturb
 # (or be disturbed by) a walkthrough the developer actually has open.
-export XDG_RUNTIME_DIR="$WORK/xdg"
+#
+# Short on purpose. $TMPDIR on macOS is ~49 characters before anything is added
+# to it, and the socket now lives under $XDG_RUNTIME_DIR/walkthrough-$USER/ --
+# which put the suite's own socket path at 117 characters, past the 104 that
+# nvim will bind where asked. The suite is not the place to discover that; there
+# is a test for it below.
+XDG_RUNTIME_DIR="$(mktemp -d /tmp/wtx.XXXXXX)"
+export XDG_RUNTIME_DIR
 mkdir -p "$XDG_RUNTIME_DIR"
 STATE_FILE="$XDG_RUNTIME_DIR/walkthrough-${USER:-x}/state"
 
@@ -24,7 +31,7 @@ STATE_FILE="$XDG_RUNTIME_DIR/walkthrough-${USER:-x}/state"
 SOCK="$WORK/player.sock"
 nvim --headless --listen "$SOCK" >/dev/null 2>&1 &
 NVIM_PID=$!
-trap 'kill "$NVIM_PID" 2>/dev/null; wait "$NVIM_PID" 2>/dev/null; rm -rf "$WORK"' EXIT
+trap 'kill "$NVIM_PID" 2>/dev/null; wait "$NVIM_PID" 2>/dev/null; rm -rf "$WORK" "$XDG_RUNTIME_DIR"' EXIT
 i=0
 while [ "$i" -lt 300 ]; do
   nvim --server "$SOCK" --remote-expr '1' >/dev/null 2>&1 && break
@@ -232,6 +239,65 @@ c3bok="$( cd "$REPO" && bash -c '
   ' _ )"
 check "C-3b a state directory we own still reads back" "cmux/H" "$c3bok"
 rm -f "$STATE_FILE"
+
+# ---------------------------------------------------------------------------
+# #31 — the socket lives in the private state directory, not shared temp.
+#
+# The socket can drive the editor: anything that reaches it can move the
+# cursor, read buffers and execute Lua. It used to sit at a guessable name in
+# a world-readable directory while the state file — which can do strictly less
+# — sat behind a 0700, symlink-refused, ownership-checked directory. The weaker
+# link defined the security of the pair.
+# ---------------------------------------------------------------------------
+sock_line="$(grep -n 'sock=' "$REPO/bin/walkthrough" | grep -v '^ *#' | head -1)"
+# shellcheck disable=SC2016  # matching a literal '$STATE_DIR' substring in the source, not expanding it
+case "$sock_line" in
+  *'$STATE_DIR'*) check "socket path is built from STATE_DIR" "0" "0" ;;
+  *) check "socket path is built from STATE_DIR" "0" "1 ($sock_line)" ;;
+esac
+case "$sock_line" in
+  *TMPDIR*) check "socket path does not use shared TMPDIR" "0" "1 ($sock_line)" ;;
+  *) check "socket path does not use shared TMPDIR" "0" "0" ;;
+esac
+
+# state_dir_ready must run BEFORE the launch command is built, because the
+# launch command names the socket and nvim will create it there.
+#
+# Comments are stripped before searching: the fix's own commentary explains
+# "state_dir_ready runs HERE..." right above the call, and an unfiltered grep
+# matches that prose line first (it sorts earlier than the real call) — which
+# would keep passing even if the call itself were deleted and only the
+# comment survived. Filtering '^ *#' lines, the same way sock_line above
+# already does, makes the assertion about the call, not the commentary.
+open_body="$(sed -n '/^cmd_open()/,/^}/p' "$REPO/bin/walkthrough" | grep -v '^ *#')"
+ready_at="$(printf '%s\n' "$open_body" | grep -n 'state_dir_ready' | head -1 | cut -d: -f1)"
+sock_at="$(printf '%s\n' "$open_body" | grep -n 'sock=' | head -1 | cut -d: -f1)"
+if [ -n "$ready_at" ] && [ -n "$sock_at" ] && [ "$ready_at" -lt "$sock_at" ]; then
+  check "cmd_open readies the state dir before naming the socket" "0" "0"
+else
+  check "cmd_open readies the state dir before naming the socket" "0" \
+    "1 (ready at ${ready_at:-none}, sock at ${sock_at:-none})"
+fi
+
+# An over-long socket path is refused, loudly, BEFORE nvim is started.
+#
+# Identical-if-broken: asserting only "open failed" passes on the old behaviour,
+# which also failed -- after burning 300 socket-wait tries, misdiagnosing it as
+# "nvim did not answer", and leaving the nvim it started running forever. So the
+# assertion is on the MESSAGE naming the path length, and on the wall clock.
+deep="$(mktemp -d /tmp/wtdeep.XXXXXX)/$(printf 'd%.0s' $(seq 1 80))"
+mkdir -p "$deep"
+t0=$(date +%s)
+out="$(XDG_RUNTIME_DIR="$deep" "$WT" open tests/fixtures/two_files.tour 2>&1)"
+rc=$?; t1=$(date +%s)
+check "an over-long socket path is refused" "1" "$rc"
+case "$out" in
+  *"socket path is too long"*) check "...and the message says why" "0" "0" ;;
+  *) check "...and the message says why" "0" "1 ($out)" ;;
+esac
+elapsed_ok=0; [ $((t1 - t0)) -le 3 ] || elapsed_ok=1
+check "...without waiting on a socket that will never appear" "0" "$elapsed_ok"
+rm -rf "$deep"
 
 # ---------------------------------------------------------------------------
 # C-4 — nothing but base64 crosses the --remote-expr boundary

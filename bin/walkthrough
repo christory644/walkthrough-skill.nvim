@@ -326,7 +326,32 @@ cmd_open() {
   [ "${#files_arr[@]}" -gt 0 ] \
     || die "no files to open for $tour (workspace root: $wsroot)"
 
-  sock="${TMPDIR:-/tmp}/walkthrough-$$.sock"; rm -f "$sock"
+  # The socket, not the state file, is the sensitive one: anything that can
+  # reach it can drive the editor — move the cursor, read buffers, run Lua. It
+  # used to live at ${TMPDIR:-/tmp}/walkthrough-$$.sock, a guessable name in a
+  # world-readable directory, mitigated only by $$ being hard to guess, which
+  # is not a security property (#31). It now sits beside the state file in the
+  # one directory this project is willing to trust: 0700, symlink-refused,
+  # ownership-checked.
+  #
+  # state_dir_ready runs HERE, before the launch command is built, because the
+  # launch command names the socket and nvim creates it on startup — the
+  # directory has to exist and have passed its checks first.
+  #
+  # Length IS a constraint, and getting it wrong is silent. Measured: past 104
+  # characters nvim truncates the path to fit sun_path and binds the socket
+  # somewhere else -- dropping the last component -- while still reporting the
+  # path you asked for as v:servername. RPC connects either way, so the failure
+  # looks like success from every angle except the one that matters: the socket
+  # is not in the directory whose ownership we checked, and `rm -f` on the
+  # recorded path deletes nothing. Refusing is the only honest answer.
+  state_dir_ready
+  sock="$STATE_DIR/sock-$$"; rm -f "$sock"
+  # 104 is macOS's limit; Linux allows 108. The smaller one is the portable
+  # bound, and a refusal here is far better than a socket we cannot clean up.
+  [ "${#sock}" -le 104 ] || die "the socket path is too long (${#sock} chars; the limit is 104):
+  $sock
+  Set XDG_RUNTIME_DIR to a shorter directory and try again."
   # The player is pinned to the same workspace root everything above resolved
   # against — see wt_nvim_cmd.
   handle="$(backend_open "$(wt_nvim_cmd "$wsroot" "$sock" ${files_arr[@]+"${files_arr[@]}"})")" \
