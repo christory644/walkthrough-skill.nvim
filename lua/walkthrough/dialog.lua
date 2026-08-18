@@ -442,7 +442,7 @@ M.RETRY_MS = 1000
 -- the failure OQ-3 exists to prevent, and an unbounded timer is how you get one.
 M.PENDING_LIMIT_MS = 600000
 
-local P = nil  -- { text, nonce, timer, since }
+local P = nil  -- { text, timer, since }
 
 function M.pending()
   if not P then return nil end
@@ -509,7 +509,10 @@ local function attempt()
     M.cancel_pending(true)
     return
   end
-  local ok = M.send_now(P.text, P.nonce)
+  -- No nonce is carried across the wait: a queued question has never been sent,
+  -- so it has never had one. `send_now` mints it at the moment of the send that
+  -- actually reaches a reader, which is the moment M.issued records it.
+  local ok = M.send_now(P.text)
   if ok then M.cancel_pending(true) end
 end
 
@@ -527,7 +530,7 @@ function M.on_refused(text, reason, message)
     "  below drops it too.",
   }, "WarningMsg")
   set_prompt_text(text)
-  P = { text = text, nonce = nil, since = (vim.uv or vim.loop).hrtime() / 1e6 }
+  P = { text = text, since = (vim.uv or vim.loop).hrtime() / 1e6 }
   P.timer = (vim.uv or vim.loop).new_timer()
   P.timer:start(M.RETRY_MS, M.RETRY_MS, vim.schedule_wrap(attempt))
   -- This is the ONLY place P is created -- the winbar's "idle" text is now
