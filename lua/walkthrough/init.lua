@@ -63,7 +63,7 @@ end
 -- all — it is not a delete-anything primitive.
 local function session_cleanup()
   local uv = vim.uv or vim.loop
-  for _, var in ipairs({ "WALKTHROUGH_STATE", "WALKTHROUGH_SOCKET" }) do
+  for _, var in ipairs({ "WALKTHROUGH_STATE", "WALKTHROUGH_SOCKET", "WALKTHROUGH_DIALOG" }) do
     local p = vim.env[var]
     if p and p ~= "" then pcall(uv.fs_unlink, p) end
   end

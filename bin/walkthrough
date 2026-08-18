@@ -141,22 +141,22 @@ state_dir_ready() {
   chmod 700 "$STATE_DIR" 2>/dev/null || true
 }
 
-state_write() { # backend handle socket tour(absolute)
+state_write() { # backend handle socket tour(absolute) dialog
   state_dir_ready
   rm -f "$STATE"   # never write through a pre-existing symlink
   ( umask 077
-    printf 'backend=%s\nhandle=%s\nsocket=%s\ntour=%s\n' \
-      "$(b64 "$1")" "$(b64 "$2")" "$(b64 "$3")" "$(b64 "$4")" > "$STATE"
+    printf 'backend=%s\nhandle=%s\nsocket=%s\ntour=%s\ndialog=%s\n' \
+      "$(b64 "$1")" "$(b64 "$2")" "$(b64 "$3")" "$(b64 "$4")" "$(b64 "${5:-}")" > "$STATE"
   ) || die "cannot write state: $STATE"
 }
 
-ST_backend=""; ST_handle=""; ST_socket=""; ST_tour=""
+ST_backend=""; ST_handle=""; ST_socket=""; ST_tour=""; ST_dialog=""
 
 # Parse. Never source. Each line is key=<base64>; anything else is corruption,
 # not a command.
 state_read() {
   local line key val
-  ST_backend=""; ST_handle=""; ST_socket=""; ST_tour=""
+  ST_backend=""; ST_handle=""; ST_socket=""; ST_tour=""; ST_dialog=""
   # The DIRECTORY, before the file (#15). Writing checked it and reading did
   # not, and the two questions are not the same one asked twice: a directory
   # someone else owns — or a symlink pointing at one — cannot produce a state
@@ -176,7 +176,12 @@ state_read() {
   if [ ! -O "$STATE" ]; then die "state file is not owned by you, refusing: $STATE"; fi
   while IFS= read -r line || [ -n "$line" ]; do
     key="${line%%=*}"; val="${line#*=}"
-    case "$key" in backend|handle|socket|tour) ;; *) continue ;; esac
+    # `dialog` is the newest key. The whitelist skips anything it does not
+    # know, so an older CLI reading a newer state file ignores it rather than
+    # choking — and a FIFO whose name is not in the current state file is by
+    # construction not this session's, which is what makes a dead session's
+    # FIFO unadoptable (P6). Nothing derives the name; it is recorded.
+    case "$key" in backend|handle|socket|tour|dialog) ;; *) continue ;; esac
     case "$val" in *[!A-Za-z0-9+/=]*) die "state file is corrupt (bad value for $key)" ;; esac
     val="$(unb64 "$val")"
     case "$key" in
@@ -184,6 +189,7 @@ state_read() {
       handle)  ST_handle="$val"  ;;
       socket)  ST_socket="$val"  ;;
       tour)    ST_tour="$val"    ;;
+      dialog)  ST_dialog="$val"  ;;
     esac
   done < "$STATE"
 }
@@ -280,14 +286,14 @@ cmd_list() {
 # $sock is a local of cmd_open, which is open_expr's only caller — bash locals
 # are dynamically scoped, so it is visible here without being passed in.
 open_expr() { # $1 = absolute tour path, $2 = handle
-  printf "luaeval('%s', ['%s','%s','%s','%s','%s','%s','%s'])" \
-    '(function(a) local d = vim.base64.decode vim.opt.runtimepath:append(d(a[1])) vim.env.WALKTHROUGH_HANDLE = d(a[3]) vim.env.WALKTHROUGH_BACKEND = d(a[4]) vim.env.WALKTHROUGH_CLI = d(a[5]) vim.env.WALKTHROUGH_STATE = d(a[6]) vim.env.WALKTHROUGH_SOCKET = d(a[7]) require("walkthrough").open(d(a[2])) return 1 end)(_A)' \
+  printf "luaeval('%s', ['%s','%s','%s','%s','%s','%s','%s','%s'])" \
+    '(function(a) local d = vim.base64.decode vim.opt.runtimepath:append(d(a[1])) vim.env.WALKTHROUGH_HANDLE = d(a[3]) vim.env.WALKTHROUGH_BACKEND = d(a[4]) vim.env.WALKTHROUGH_CLI = d(a[5]) vim.env.WALKTHROUGH_STATE = d(a[6]) vim.env.WALKTHROUGH_SOCKET = d(a[7]) vim.env.WALKTHROUGH_DIALOG = d(a[8]) require("walkthrough").open(d(a[2])) return 1 end)(_A)' \
     "$(b64 "$ROOT")" "$(b64 "$1")" "$(b64 "$2")" "$(b64 "$BACKEND")" \
-    "$(b64 "$ROOT/bin/walkthrough")" "$(b64 "$STATE")" "$(b64 "$sock")"
+    "$(b64 "$ROOT/bin/walkthrough")" "$(b64 "$STATE")" "$(b64 "$sock")" "$(b64 "$fifo")"
 }
 
 cmd_open() {
-  local tour tourabs wsroot sock handle f skips line
+  local tour tourabs wsroot sock fifo handle f skips line
   local -a files_arr=()
   tour="${1:-}"; [ -f "$tour" ] || die "no such tour: $tour"
   # Absolutise BEFORE anything runs from another directory, and settle the
@@ -358,6 +364,17 @@ cmd_open() {
   [ "${#sock}" -le 104 ] || die "the socket path is too long (${#sock} chars; the limit is 104):
   $sock
   Set XDG_RUNTIME_DIR to a shorter directory and try again."
+
+  # The dialog channel (#21). Created here — same actor, same moment, same
+  # failure path as the socket — because the plugin cannot decide whether its
+  # own directory is trustworthy and this CLI already has.
+  #
+  # rm -f first: a stale FIFO from a dead session is never adopted, it is
+  # replaced. mkfifo refuses to overwrite, so without this an abandoned FIFO
+  # would fail every subsequent open.
+  fifo="$STATE_DIR/dialog-$$.fifo"; rm -f "$fifo"
+  ( umask 077; mkfifo -m 600 "$fifo" ) || die "cannot create the dialog channel: $fifo"
+
   # The player is pinned to the same workspace root everything above resolved
   # against — see wt_nvim_cmd.
   handle="$(backend_open "$(wt_nvim_cmd "$wsroot" "$sock" ${files_arr[@]+"${files_arr[@]}"})")" \
@@ -366,18 +383,18 @@ cmd_open() {
   # Readiness is the socket, never the shell prompt. 300 tries (~9s) matches
   # the measured worst-case nvim startup time (Task 7); do not lower it.
   wt_wait_for_socket "$sock" 300 \
-    || { backend_close "$handle"; die "nvim never came up on $sock (surface $handle)"; }
+    || { backend_close "$handle"; rm -f "$fifo"; die "nvim never came up on $sock (surface $handle)"; }
 
   # WALKTHROUGH_CLI is the absolute path to this running CLI (derived from
   # $ROOT, not $0, which may be relative). M.close() prefers it over a PATH
   # lookup so teardown works even when bin/ was never put on PATH — putting
   # it on PATH is documented as optional, so the plugin cannot depend on it.
   nvim --server "$sock" --remote-expr "$(open_expr "$tourabs" "$handle")" >/dev/null \
-    || { backend_close "$handle"; die "failed to render the tour (surface $handle)"; }
+    || { backend_close "$handle"; rm -f "$fifo"; die "failed to render the tour (surface $handle)"; }
 
   # Absolute, so `reload` from any directory targets the tour that is actually
   # playing rather than resolving the name against the wrong CWD.
-  state_write "$BACKEND" "$handle" "$sock" "$tourabs"
+  state_write "$BACKEND" "$handle" "$sock" "$tourabs" "$fifo"
   echo "$handle"; echo "$sock"
 }
 
@@ -493,7 +510,7 @@ cmd_close() {
     echo "  backend: $ST_backend   handle: $ST_handle" >&2
     echo "  Close it by hand; the walkthrough's own state has been cleared." >&2
   fi
-  rm -f "$STATE" "$ST_socket"
+  rm -f "$STATE" "$ST_socket" "$ST_dialog"
   return "$rc"
 }
 

@@ -40,12 +40,12 @@ done
 
 # Write a state file using the CLI's own writer, so these tests exercise the
 # real format rather than a hand-rolled imitation of it.
-plant_state() { # backend handle socket tour
+plant_state() { # backend handle socket tour [dialog]
   ( cd "$REPO" && bash -c '
       set -uo pipefail
       source ./bin/walkthrough --help >/dev/null 2>&1
-      state_write "$1" "$2" "$3" "$4"
-    ' _ "$1" "$2" "$3" "$4" )
+      state_write "$1" "$2" "$3" "$4" "${5:-}"
+    ' _ "$1" "$2" "$3" "$4" "${5:-}" )
 }
 
 # ---------------------------------------------------------------------------
@@ -313,17 +313,18 @@ c4expr="$( cd "$REPO" && bash -c '
     BACKEND=cmux
     STATE="/tmp/c4-state"
     sock="/tmp/c4-sock"
+    fifo="/tmp/c4-fifo"
     open_expr "$1" "HANDLE"
   ' _ "$c4payload" )"
 printf %s "$c4expr" | grep -q "system(" && c4leak=1 || c4leak=0
 check "C-4 no attacker text reaches the remote expression" "0" "$c4leak"
 # The quote count is the sharp version of the same claim: the expression is
-# luaeval('<chunk>', ['a','b','c','d','e','f','g']) — two quotes around the
-# chunk plus fourteen around the seven base64 arguments, sixteen in total, and
-# not one of them comes from the tour path. Any injected quote changes this
-# number.
+# luaeval('<chunk>', ['a','b','c','d','e','f','g','h']) — two quotes around
+# the chunk plus sixteen around the eight base64 arguments, eighteen in
+# total, and not one of them comes from the tour path. Any injected quote
+# changes this number.
 c4quotes="$(printf %s "$c4expr" | tr -cd "'" | wc -c | tr -d ' ')"
-check "C-4 the remote expression holds exactly its own 16 quotes" "16" "$c4quotes"
+check "C-4 the remote expression holds exactly its own 18 quotes" "18" "$c4quotes"
 
 # ...and the far side gets the payload back, verbatim, as data.
 c4b64="$(printf %s "$c4payload" | base64 | tr -d '\n')"
@@ -334,6 +335,57 @@ nvim --headless --clean \
 check "C-4 base64 carries the payload across intact" "$c4payload" "$(cat "$WORK/c4decoded.txt" 2>/dev/null)"
 [ -e "$WORK/PWNED_C4" ] && c4exec=1 || c4exec=0
 check "C-4 vimscript system() never ran" "0" "$c4exec"
+
+# ---------------------------------------------------------------------------
+# The dialog channel: created by the CLI, in the one directory it trusts.
+#
+# The plugin cannot create it safely — it does not know whether its directory
+# is trustworthy — so the same actor that creates the socket creates this, at
+# the same moment, with the same failure path.
+# ---------------------------------------------------------------------------
+FIFO_STATE="$WORK/fifo-state"; mkdir -p "$FIFO_STATE"
+( cd "$REPO" && bash -c '
+    set -uo pipefail
+    source ./bin/walkthrough --help >/dev/null 2>&1
+    state_write b h /tmp/s /tmp/t.tour "$1"
+    state_read
+    printf "%s\n" "$ST_dialog"
+  ' _ "$FIFO_STATE/dialog-1.fifo" ) > "$WORK/dialog-roundtrip"
+check "dialog path round-trips through the state file" \
+  "$FIFO_STATE/dialog-1.fifo" "$(cat "$WORK/dialog-roundtrip")"
+
+# An older CLI's state file has no dialog= line. state_read's whitelist skips
+# unknown keys, so a NEWER file read by an OLDER CLI is already fine; this is
+# the other direction, and it must not die.
+printf 'backend=%s\nhandle=%s\nsocket=%s\ntour=%s\n' \
+  "$(printf b | base64)" "$(printf h | base64)" \
+  "$(printf /tmp/s | base64)" "$(printf /tmp/t | base64)" \
+  > "$XDG_RUNTIME_DIR/walkthrough-${USER:-x}/state"
+( cd "$REPO" && bash -c '
+    set -uo pipefail
+    source ./bin/walkthrough --help >/dev/null 2>&1
+    state_read
+    printf "[%s]\n" "$ST_dialog"
+  ' ) > "$WORK/dialog-absent"
+check "a state file with no dialog= reads as empty, not as an error" \
+  "[]" "$(cat "$WORK/dialog-absent")"
+
+# cmd_open must make it a FIFO, mode 0600, inside STATE_DIR. Comments are
+# stripped BEFORE the grep, not after: `grep -n | grep -v '^ *#'` numbers
+# every line first, so "NNN:" never matches the comment filter and prose in a
+# comment would satisfy the check exactly as well as real code. Filtering
+# first makes this an assertion about the call, not the commentary.
+open_body="$(sed -n '/^cmd_open()/,/^}/p' "$REPO/bin/walkthrough" | grep -v '^ *#')"
+printf '%s\n' "$open_body" | grep -q 'mkfifo' \
+  ; check "cmd_open creates the dialog FIFO" "0" "$?"
+# shellcheck disable=SC2016  # matching a literal '$STATE_DIR' substring in the source, not expanding it
+printf '%s\n' "$open_body" | grep -q 'fifo="\$STATE_DIR/dialog-\$\$\.fifo"' \
+  ; check "the FIFO lives in STATE_DIR, named for this CLI's pid" "0" "$?"
+
+# ...and cmd_close must take it away, as a backstop to the plugin.
+close_body="$(sed -n '/^cmd_close()/,/^}/p' "$REPO/bin/walkthrough" | grep -v '^ *#')"
+printf '%s\n' "$close_body" | grep -q 'ST_dialog' \
+  ; check "cmd_close removes the dialog FIFO" "0" "$?"
 
 # ---------------------------------------------------------------------------
 # I-3 — the step argument is an integer or it is refused
