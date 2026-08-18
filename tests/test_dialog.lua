@@ -179,4 +179,46 @@ T.ok(vim.iter(vim.api.nvim_buf_get_lines(dialog.bufnr(), 0, -1, false)):any(func
 end), "and keeps the transcript")
 wt.close()
 
+-- Review round 1, Critical: state.path (and so ctx.tour) went to "" after
+-- EVERY reload, permanently, until the walkthrough was closed and reopened.
+-- M.reload calls M.open with `t`, the already-parsed/validated TABLE, never
+-- with path_or_tour itself -- so M.open's own `type(...) == "string"` gate
+-- can never see a string during a reload. The question still crossed the
+-- FIFO, it just stopped naming which tour it was about.
+--
+-- Asserted through dialog.submit's real payload (as P4 does), not a new
+-- accessor: that is the actual data that would reach the agent.
+local function sent_tour(question)
+  local real_send = channel.send
+  local payload
+  channel.send = function(_path, p) payload = p return true end
+  dialog.submit(question)
+  channel.send = real_send
+  return vim.json.decode(payload).tour
+end
+
+local abspath = vim.fn.fnamemodify("tests/fixtures/two_files.tour", ":p")
+
+wt.open("tests/fixtures/two_files.tour")
+wt.ask()
+wt.reload("tests/fixtures/two_files.tour")
+T.eq(sent_tour("what file is this?"), abspath,
+  "ctx.tour after a successful reload is the tour's absolute path, not empty")
+wt.close()
+
+-- ...and the restore-the-previous-tour branch of a FAILED reload: M.open is
+-- called there with previous_tour, ALSO a table (the tour state already held,
+-- not the string the walkthrough was originally opened with), so its gate is
+-- just as blind. state.path must come back as the path the reader is still
+-- actually looking at.
+wt.open("tests/fixtures/two_files.tour")
+local reload_ok = pcall(wt.reload, { title = "nothing plays", steps = {
+  { title = "gone", file = "tests/fixtures/does-not-exist.txt", line = 1, description = "d" },
+} })
+T.ok(not reload_ok, "a reload to an all-unplayable tour fails")
+wt.ask()
+T.eq(sent_tour("still about the same tour?"), abspath,
+  "ctx.tour after a FAILED reload (previous tour restored) is still the original absolute path")
+wt.close()
+
 T.done()

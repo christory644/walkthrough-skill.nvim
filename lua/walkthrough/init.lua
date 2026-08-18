@@ -143,6 +143,7 @@ local function teardown()
   state.augroup, state.active, state.tour, state.index, state.touched =
     nil, false, nil, 0, {}
   state.attached = {}
+  state.path = nil
   -- Clear the list we built, and only that one. The quickfix list is a single
   -- global slot the reader can claim at any moment -- a `:grep` mid-tour makes
   -- it theirs -- and this call used to empty whatever was in it, so closing a
@@ -299,7 +300,17 @@ function M.reload(path_or_tour)
     error("reload failed: " .. tostring(t) .. " (the walkthrough is unchanged)", 0)
   end
 
+  -- The new tour's absolute path, computed the same way M.open computes it --
+  -- but computed HERE, from path_or_tour, because M.open below is called with
+  -- `t` (the already-parsed/validated TABLE), not with path_or_tour itself, so
+  -- M.open's own `type(...) == "string"` gate can never see a string during a
+  -- reload and would otherwise leave state.path nil on every reload, even one
+  -- the CLI always drives with a real path.
+  local new_path = type(path_or_tour) == "string"
+    and vim.fn.fnamemodify(path_or_tour, ":p") or nil
+
   local previous_tour = state.tour
+  local previous_path = state.path
   local previous = tour_mod.step_id(state.tour, state.index)
   -- Flip inactive before touching any buffer below: `:edit!` on a buffer that
   -- is still current can re-trigger our own BufEnter autocmd, and while
@@ -327,6 +338,10 @@ function M.reload(path_or_tour)
     -- were standing. Put the previous tour back, on the step they were on.
     teardown()
     if pcall(M.open, previous_tour) then
+      -- M.open just set state.path from previous_tour, a TABLE, so its own
+      -- gate left it nil -- restore the path the reader was actually looking
+      -- at before this reload was attempted.
+      state.path = previous_path
       goto_id(previous)
       error("reload failed: " .. tostring(oerr) ..
         " (the previous walkthrough was kept)", 0)
@@ -335,6 +350,10 @@ function M.reload(path_or_tour)
     error("reload failed: " .. tostring(oerr) ..
       " (and the previous walkthrough could not be restored, so it is closed)", 0)
   end
+  -- Likewise: M.open just set state.path from `t`, a TABLE, so its own gate
+  -- left it nil -- state.path is the one fact about this reload that M.open
+  -- cannot determine for itself.
+  state.path = new_path
   goto_id(previous)
   if dialog_was_open then dialog.on_reload(dialog_ctx()) end
   return M.state()
