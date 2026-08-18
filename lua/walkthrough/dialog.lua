@@ -229,14 +229,43 @@ end
 M.ANSWER_TIMEOUT_MS = 300000
 
 local SPINNER = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" }
-local W = nil  -- { nonce, since, timer, frame, mark }
+
+-- W is the live line's DISPLAY state -- which outstanding question the spinner
+-- is drawn for -- and nothing else. A question's own clock lives ON THE
+-- QUESTION, in M.issued, because W is a single slot and M.mark_waiting begins by
+-- stopping the previous watchdog: with two questions in flight it destroyed the
+-- first one's clock. Two in flight is ordinary, not exotic -- OQ-3 keeps a
+-- question that found no reader and auto-sends it the moment one attaches, which
+-- is precisely when the reader has already asked another. The first question
+-- then reached NO terminal state at all (answered and timed_out both stayed
+-- false forever), so its answer arrived unmarked, under a bare "agent:", and
+-- read as the answer to the question the reader asked LAST.
+local W = nil   -- { nonce, since, frame, mark }
+-- One watchdog for the whole dialog: it ticks while ANY question is
+-- outstanding, and every tick services all of them.
+local WT = nil
+
+local function now_ms() return (vim.uv or vim.loop).hrtime() / 1e6 end
+
+-- Every question that was sent and has not reached a terminal state, newest
+-- first. `since` is set when the question is sent, so an entry without one was
+-- never actually in flight.
+local function outstanding()
+  local live = {}
+  for nonce, q in pairs(M.issued) do
+    if q.since and not q.answered and not q.timed_out then
+      table.insert(live, { nonce = nonce, since = q.since })
+    end
+  end
+  table.sort(live, function(a, b) return a.since > b.since end)
+  return live
+end
 
 -- Tier 1: a live line drawn as an EXTMARK, not as text, so the answer replaces
 -- it and the transcript is never littered with dead spinners.
 local function draw_working()
-  if not (M.is_open() and W) then return end
-  local uv = vim.uv or vim.loop
-  local secs = math.floor((uv.hrtime() / 1e6 - W.since) / 1000)
+  if not (M.has_buffer() and W) then return end
+  local secs = math.floor((now_ms() - W.since) / 1000)
   W.frame = (W.frame % #SPINNER) + 1
   local at = math.max(vim.api.nvim_buf_line_count(S.buf) - 1, 0)
   W.mark = vim.api.nvim_buf_set_extmark(S.buf, M.NS, at, 0, {
@@ -248,36 +277,89 @@ local function draw_working()
   M.refresh()
 end
 
-function stop_working()
-  if not W then return end
-  if W.timer then pcall(function() W.timer:stop() W.timer:close() end) end
-  if W.mark and M.is_open() then
+local function clear_mark()
+  if W and W.mark and M.has_buffer() then
     pcall(vim.api.nvim_buf_del_extmark, S.buf, M.NS, W.mark)
   end
   W = nil
+end
+
+local function stop_timer()
+  if not WT then return end
+  local t = WT
+  WT = nil  -- cleared FIRST: this is reached from inside the timer's own
+  pcall(function() t:stop() t:close() end)  -- callback, via resync.
+end
+
+function stop_working()
+  if not (W or WT) then return end
+  clear_mark()
+  stop_timer()
   M.refresh()
 end
 
-function M.mark_waiting(nonce)
-  stop_working()
-  local uv = vim.uv or vim.loop
-  W = { nonce = nonce, since = uv.hrtime() / 1e6, frame = 0, mark = nil }
-  W.timer = uv.new_timer()
-  W.timer:start(0, 100, vim.schedule_wrap(function()
-    if not W then return end
-    if (uv.hrtime() / 1e6 - W.since) > M.ANSWER_TIMEOUT_MS then
-      local q = M.issued[W.nonce]
-      if q then q.timed_out = true end
-      stop_working()
+-- resync and tick call each other (a tick that expires a question re-points the
+-- live line; re-pointing restarts the ticker), so both are declared before
+-- either is defined.
+local resync, tick
+
+local function start_timer()
+  if WT then return end
+  WT = (vim.uv or vim.loop).new_timer()
+  WT:start(0, 100, vim.schedule_wrap(function() tick() end))
+end
+
+-- A question just reached a terminal state. Point the live line at whatever is
+-- still outstanding -- the newest, so it tracks the question the reader most
+-- recently asked -- and take the line and the ticker away when nothing is left.
+resync = function()
+  local live = outstanding()
+  if #live == 0 then stop_working() return end
+  if not (W and W.nonce == live[1].nonce) then
+    clear_mark()
+    W = { nonce = live[1].nonce, since = M.issued[live[1].nonce].since, frame = 0, mark = nil }
+  end
+  start_timer()
+  M.refresh()
+end
+
+-- One tick services EVERY outstanding question, not just the one on screen.
+-- That is the whole repair: the deadline is per question, so a second question
+-- can no longer cancel the first one's.
+tick = function()
+  local expired = false
+  for _, q in pairs(M.issued) do
+    if q.since and not q.answered and not q.timed_out
+      and now_ms() - q.since > M.ANSWER_TIMEOUT_MS then
+      q.timed_out = true
+      expired = true
       -- One of four distinguishable terminal states. This one is "the agent
       -- stopped waiting", which is a different fact from "no agent is
       -- listening" (never attached) and from "the agent went away" (died
-      -- mid-wait) -- the reader can act on the difference.
-      M.append({ "walkthrough: the agent stopped waiting — ask again." }, "WarningMsg")
-      return
+      -- mid-wait) -- the reader can act on the difference. It names the step,
+      -- for the same reason a late answer does: with more than one question in
+      -- flight, an unattributed line is read as being about the last one asked.
+      M.append({ string.format(
+        "walkthrough: the agent stopped waiting on step %s, \"%s\" — ask again.",
+        tostring(q.index), tostring(q.step)) }, "WarningMsg")
     end
-    draw_working()
-  end))
+  end
+  if expired then resync() return end
+  if W then draw_working() end
+end
+
+function M.mark_waiting(nonce)
+  local q = M.issued[nonce]
+  -- The clock belongs to the question, and starts when it was sent. Nothing to
+  -- watch for a nonce that was never issued.
+  if not q then return end
+  q.since = q.since or now_ms()
+  if not (W and W.nonce == nonce) then
+    clear_mark()
+    W = { nonce = nonce, since = q.since, frame = 0, mark = nil }
+  end
+  start_timer()
+  M.refresh()
 end
 
 function M.on_sent(nonce) M.mark_waiting(nonce) end
@@ -288,7 +370,6 @@ function M.answer(nonce, text)
   if not q then
     return false, "no question is waiting on that nonce: " .. tostring(nonce)
   end
-  if W and W.nonce == nonce then stop_working() end
   local lines = M.sanitise(text)
   if q.answered or q.timed_out then
     -- OQ-4: append, clearly marked, and NAME THE STEP. The likeliest moment for
@@ -298,10 +379,20 @@ function M.answer(nonce, text)
       "agent (late — this answers step %s, \"%s\"):",
       tostring(q.index), tostring(q.step)))
   else
-    table.insert(lines, 1, "agent:")
+    -- The step is named on the ordinary path too. Two questions can be in
+    -- flight at once and their answers can come back in either order, so a bare
+    -- "agent:" is a claim the transcript cannot back up -- the reader reads it
+    -- as answering whatever they asked LAST. Naming the step costs nothing and
+    -- makes every answer attributable to its own question.
+    table.insert(lines, 1, string.format(
+      "agent (step %s, \"%s\"):", tostring(q.index), tostring(q.step)))
   end
   q.answered = true
   M.append(lines, nil)
+  -- This question is done: hand the live line to whichever question is still
+  -- outstanding, or take it away. Done AFTER the append so the spinner cannot
+  -- outlive the answer that replaced it.
+  resync()
   return true
 end
 

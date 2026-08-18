@@ -482,4 +482,74 @@ T.ok(not vim.iter(vim.api.nvim_buf_get_keymap(vim.api.nvim_get_current_buf(), "n
   "the dismiss key is never bound on a code buffer")
 wt.close()
 
+-- ---------------------------------------------------------------------------
+-- F3 (Important) — two questions in flight.
+--
+-- W was a single slot and mark_waiting stopped the previous watchdog, so the
+-- FIRST question lost its clock the moment a second was sent: it reached no
+-- terminal state ever, and its answer arrived under a bare "agent:" that the
+-- reader reads as answering the question they asked LAST. Two in flight is
+-- ordinary -- OQ-3 keeps a question that found no reader and auto-sends it when
+-- one attaches, which is exactly when another has already been typed.
+--
+-- The questions are asked on DIFFERENT steps on purpose: with both on the same
+-- step, "the answer names its own step" and "the answer names the step the
+-- reader is on" are the same string, and the assertion could not fail.
+-- ---------------------------------------------------------------------------
+local function two_in_flight()
+  local sent = {}
+  local real = channel.send
+  channel.send = function(_p, payload) table.insert(sent, vim.json.decode(payload)) return true end
+  wt.ask()
+  dialog.submit("Q1: why is this step here?")
+  wt.step(1)
+  wt.ask()  -- rescope to step 2, as the reader moving on does
+  dialog.submit("Q2: and what about this one?")
+  channel.send = real
+  return sent
+end
+
+dialog.ANSWER_TIMEOUT_MS = 300000
+wt.open("tests/fixtures/two_files.tour")
+local sent = two_in_flight()
+T.eq(#sent, 2, "both questions were sent")
+T.eq(sent[1].index, 1, "Q1 was asked on step 1")
+T.eq(sent[2].index, 2, "Q2 was asked on step 2")
+
+dialog.answer(sent[1].nonce, "because it introduces the retry.")
+local f3_body = transcript()
+T.ok(f3_body:find(string.format('agent (step %s, "%s"):', sent[1].index, sent[1].step_id), 1, true) ~= nil,
+  "Q1's answer names the step Q1 was asked on")
+T.ok(f3_body:find(string.format('"%s"', sent[2].step_id), 1, true) == nil,
+  "...and nothing in it points at the step the reader has moved on to")
+wt.close()
+
+-- Every issued question reaches a terminal state, including one that a later
+-- question displaced from the spinner.
+wt.open("tests/fixtures/two_files.tour")
+sent = two_in_flight()
+dialog.ANSWER_TIMEOUT_MS = 200
+local q1, q2 = sent[1].nonce, sent[2].nonce
+vim.wait(3000, function()
+  return dialog.issued[q1].timed_out and dialog.issued[q2].timed_out
+end, 50)
+T.ok(dialog.issued[q1].timed_out, "the FIRST question times out (its watchdog was destroyed)")
+T.ok(dialog.issued[q2].timed_out, "and so does the second")
+local f3_timeouts = transcript()
+T.ok(f3_timeouts:find(string.format('stopped waiting on step %s, "%s"', sent[1].index, sent[1].step_id),
+  1, true) ~= nil, "the transcript says which question was abandoned, by step, for Q1")
+T.ok(f3_timeouts:find(string.format('stopped waiting on step %s, "%s"', sent[2].index, sent[2].step_id),
+  1, true) ~= nil, "...and for Q2")
+T.ok(tostring(vim.wo[dialog.winid()].winbar):find("idle", 1, true) ~= nil,
+  "with nothing left outstanding the winbar goes back to idle")
+
+-- ...and an answer arriving after that is marked late AND names its own step,
+-- which is OQ-4's binding ruling.
+dialog.answer(q1, "an answer nobody was waiting for any more")
+local f3_late = transcript()
+T.ok(f3_late:find(string.format('late — this answers step %s, "%s"', sent[1].index, sent[1].step_id),
+  1, true) ~= nil, "a late answer is marked late and names the step it answers")
+dialog.ANSWER_TIMEOUT_MS = 300000
+wt.close()
+
 T.done()
