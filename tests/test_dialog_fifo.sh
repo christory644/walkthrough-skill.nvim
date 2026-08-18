@@ -317,6 +317,209 @@ check "edited: the drop is announced"                            "true" "$(echo 
 check "edited: the late reader received NOTHING (times out)"    "4"    "$e_grc"
 check "edited: ...and printed nothing"           "0" "$(printf '%s' "$e_got" | wc -c | tr -d ' ')"
 
+# ---------------------------------------------------------------------------
+# P2 — a question delivered to a blocked reader arrives BECAUSE it was written.
+#
+# Identical-if-broken: start a reader, write, assert the reader printed the
+# line. That passes whether delivery was instant, whether the reader had been
+# spinning on a poll loop, and whether it was ever waiting at all.
+#
+# Three things make it decidable:
+#   * the reader is observed STILL RUNNING (kill -0) and its output file EMPTY
+#     immediately before the write;
+#   * its return timestamp falls AFTER the write timestamp, inside a small
+#     delta (second granularity via `date +%s` is enough for a 5s bound; no
+#     python3, per the controller ruling -- none of this repo's other tests
+#     depend on it);
+#   * and the control below -- the same run with NO WRITE -- must time out
+#     non-zero and print nothing. Without that control, a reader that returns
+#     empty immediately passes an "it arrived" test that only checks status.
+# ---------------------------------------------------------------------------
+P2="$WORK/p2"; mkdir -p "$P2"; mkfifo -m 600 "$P2/f"
+nvim --headless --clean -l "$REPO/lua/walkthrough/await.lua" "$P2/f" 20000 "$P2/ready" \
+  > "$P2/out" 2>/dev/null &
+RP=$!; PIDS+=("$RP")
+n=0; while [ ! -f "$P2/ready" ] && [ "$n" -lt 200000 ]; do n=$((n + 1)); done
+kill -0 "$RP" 2>/dev/null;  check "P2 control: the reader is blocked before the write" "0" "$?"
+check "P2 control: it has printed nothing yet" "0" "$(wc -c < "$P2/out" | tr -d ' ')"
+wrote_at="$(date +%s)"
+cat > "$P2/send.lua" <<'LUA'
+vim.opt.runtimepath:append(vim.env.WT_REPO)
+local ok, reason = require("walkthrough.channel").send(_G.arg[1],
+  '{"tour":"/tmp/t.tour","step_id":"the retry","index":1,"question":"why not a plain spawn?","nonce":"n1"}')
+-- io.write, not print: nvim's `print` in --headless -l mode writes to STDERR
+-- (see the header comment on $WORK/send.lua above), so a bare $(...) capture
+-- of it -- which P3 and P6 both do -- would always read empty regardless of
+-- whether the send was actually refused.
+io.write(tostring(ok) .. "|" .. tostring(reason) .. "\n")
+os.exit(ok and 0 or 1)
+LUA
+WT_REPO="$REPO" nvim --headless --clean -l "$P2/send.lua" "$P2/f" >/dev/null
+check "P2: the send reported success" "0" "$?"
+wait "$RP"; rc=$?
+back_at="$(date +%s)"
+check "P2: the reader exited 0" "0" "$rc"
+printf '%s' "$(cat "$P2/out")" | grep -q '"question":"why not a plain spawn?"'
+check "P2: it printed the question that was written" "0" "$?"
+if [ "$back_at" -ge "$wrote_at" ] && [ $((back_at - wrote_at)) -le 5 ]; then within_delta=0; else within_delta=1; fi
+check "P2: it returned AFTER the write, inside a few seconds" "0" "$within_delta"
+
+# The control that gives the above its meaning.
+mkfifo -m 600 "$P2/f2"
+out2="$(nvim --headless --clean -l "$REPO/lua/walkthrough/await.lua" "$P2/f2" 1200 2>/dev/null)"
+check "P2 control: with NO write, the reader exits non-zero" "4" "$?"
+check "P2 control: and prints nothing"                       ""  "$out2"
+
+# ---------------------------------------------------------------------------
+# P3 — a second question before the first is answered is never silently lost.
+#
+# Identical-if-broken: asserting the second write "succeeded" CANNOT FAIL --
+# with a reader attached the kernel buffers it and reports success even though
+# nobody will ever read it. So the assertion is on the far side: the reader
+# consumed the first and exited, and the second was REFUSED, visibly (OQ-3:
+# refuse the transport, keep the text).
+# ---------------------------------------------------------------------------
+P3="$WORK/p3"; mkdir -p "$P3"; mkfifo -m 600 "$P3/f"
+nvim --headless --clean -l "$REPO/lua/walkthrough/await.lua" "$P3/f" 20000 "$P3/ready" \
+  > "$P3/first" 2>/dev/null &
+RP3=$!; PIDS+=("$RP3")
+n=0; while [ ! -f "$P3/ready" ] && [ "$n" -lt 200000 ]; do n=$((n + 1)); done
+WT_REPO="$REPO" nvim --headless --clean -l "$P2/send.lua" "$P3/f" >/dev/null
+check "P3: the first question was sent" "0" "$?"
+wait "$RP3"; check "P3: the reader took it and exited" "0" "$?"
+res="$(WT_REPO="$REPO" nvim --headless --clean -l "$P2/send.lua" "$P3/f")"
+check "P3: the second is refused, not buffered for nobody" \
+  "false|no_reader" "$res"
+
+# ---------------------------------------------------------------------------
+# P6 — a dead session's FIFO is never adopted.
+#
+# Identical-if-broken: plant a stale FIFO, open a new walkthrough, assert it
+# works -- that passes either way. The discriminating assertions are that a
+# write into the STALE path reaches nobody, and that the live path is the one
+# named in the CURRENT state file.
+# ---------------------------------------------------------------------------
+P6="$WORK/p6"; mkdir -p "$P6"
+STALE="$XDG_RUNTIME_DIR/walkthrough-${USER:-x}/dialog-99999.fifo"
+mkdir -p "$(dirname "$STALE")"; mkfifo -m 600 "$STALE"
+( cd "$REPO" && bash -c '
+    set -uo pipefail
+    source ./bin/walkthrough --help >/dev/null 2>&1
+    state_write b h /tmp/s /tmp/t.tour "$1"
+    state_read
+    printf "%s\n" "$ST_dialog"
+  ' _ "$P6/live.fifo" ) > "$P6/named"
+check "P6: the state file names the live FIFO, not the stale one" \
+  "$P6/live.fifo" "$(cat "$P6/named")"
+res="$(WT_REPO="$REPO" nvim --headless --clean -l "$P2/send.lua" "$STALE")"
+check "P6: a write into the stale FIFO reaches nobody" "false|no_reader" "$res"
+
+# ---------------------------------------------------------------------------
+# cmd_await — the CLI verb the agent actually invokes has no coverage of its
+# own (carried over from Task 4: only await.lua, its inner script, was ever
+# exercised). Two things are covered here: argument validation, and the exit-
+# status contract end to end (0 = a question arrived, 4 = nobody asked -- a
+# NORMAL outcome the agent must not treat as an error -- other = a real
+# failure), including that `nvim -l` propagates await.lua's own status rather
+# than flattening every non-zero exit to 1.
+# ---------------------------------------------------------------------------
+WT="$REPO/bin/walkthrough"
+CA="$WORK/cmd_await"; mkdir -p "$CA"
+STATE_UNDER_TEST="$XDG_RUNTIME_DIR/walkthrough-${USER:-x}/state"
+rm -f "$STATE_UNDER_TEST"
+
+# Argument validation runs BEFORE with_state. Identical-if-broken: with no
+# active walkthrough, a bad --timeout dies either way (with_state's own "no
+# active walkthrough" also exits non-zero), so checking exit status alone
+# cannot tell "checked first" from "checked second". The discriminating
+# assertion is the MESSAGE: with no state file present at all, a refusal that
+# names --timeout can only have come from the argument check running before
+# with_state ever touched the (nonexistent) state file.
+err="$("$WT" await --timeout abc 2>&1 1>/dev/null)"; rc=$?
+check "await --timeout abc: exits non-zero" "1" "$rc"
+case "$err" in
+  *"await --timeout takes whole seconds"*) check "await --timeout abc: refused on its own terms, before touching state" "0" "0" ;;
+  *) check "await --timeout abc: refused on its own terms, before touching state" "0" "1 ($err)" ;;
+esac
+
+err="$("$WT" await --timeout 0 2>&1 1>/dev/null)"; rc=$?
+check "await --timeout 0: exits non-zero" "1" "$rc"
+case "$err" in
+  *"must be between 1 and 3600 seconds"*) check "await --timeout 0: out of range, low, refused before touching state" "0" "0" ;;
+  *) check "await --timeout 0: out of range, low, refused before touching state" "0" "1 ($err)" ;;
+esac
+
+err="$("$WT" await --timeout 3601 2>&1 1>/dev/null)"; rc=$?
+check "await --timeout 3601: exits non-zero" "1" "$rc"
+case "$err" in
+  *"must be between 1 and 3600 seconds"*) check "await --timeout 3601: out of range, high, refused before touching state" "0" "0" ;;
+  *) check "await --timeout 3601: out of range, high, refused before touching state" "0" "1 ($err)" ;;
+esac
+if [ ! -e "$STATE_UNDER_TEST" ]; then no_state_created=0; else no_state_created=1; fi
+check "await --timeout <bad>: no state file was ever created by any of the above" "0" "$no_state_created"
+
+# Write state with the CLI's own writer, so this exercises the real format --
+# and the same helper as tests/test_cli.sh, deliberately, so the two suites
+# cannot come to disagree about what a planted state file looks like.
+plant_state() { # backend handle socket tour [dialog]
+  ( cd "$REPO" && bash -c '
+      set -uo pipefail
+      source ./bin/walkthrough --help >/dev/null 2>&1
+      state_write "$1" "$2" "$3" "$4" "${5:-}"
+    ' _ "$1" "$2" "$3" "$4" "${5:-}" )
+}
+
+# A real --remote-expr target, exactly as tests/test_cli.sh uses one: without
+# it, `with_state` dies at "the walkthrough is gone" before cmd_await ever
+# reaches the transport, and every case below would collapse to the same rc=1.
+SOCK2="$CA/player.sock"
+nvim --headless --listen "$SOCK2" >/dev/null 2>&1 &
+SPID=$!; PIDS+=("$SPID")
+n=0
+while [ "$n" -lt 300 ]; do
+  nvim --server "$SOCK2" --remote-expr '1' >/dev/null 2>&1 && break
+  n=$((n + 1))
+done
+nvim --server "$SOCK2" --remote-expr '1' >/dev/null 2>&1
+check "cmd_await fixture: the stand-in player is reachable" "0" "$?"
+
+# 4 -- nobody asked. A real FIFO, a real state file, nobody ever writes.
+mkfifo -m 600 "$CA/dialog.fifo"
+plant_state tmux h "$SOCK2" /tmp/t.tour "$CA/dialog.fifo"
+"$WT" await --timeout 1 >"$CA/out4" 2>"$CA/err4"
+check "await: exits 4 when nobody asks (not an error, a normal outcome)" "4" "$?"
+check "await: prints nothing on stdout when nobody asks" "0" "$(wc -c < "$CA/out4" | tr -d ' ')"
+
+# 0 -- a question arrived. There is no ready-file hook through the CLI verb
+# (unlike the direct await.lua invocations above), so this waits on the same
+# fixed-iteration delay the O_WRONLY control earlier in this suite uses, then
+# writes for real.
+"$WT" await --timeout 20 >"$CA/out0" 2>"$CA/err0" &
+CAP=$!; PIDS+=("$CAP")
+n=0; while [ "$n" -lt 400000 ]; do n=$((n + 1)); done
+WT_REPO="$REPO" nvim --headless --clean -l "$P2/send.lua" "$CA/dialog.fifo" >/dev/null
+check "await: the send into the CLI's own reader reported success" "0" "$?"
+wait "$CAP"
+check "await: exits 0 when a question arrives" "0" "$?"
+grep -q '"question":"why not a plain spawn?"' "$CA/out0"
+check "await: the question printed is the one that was written" "0" "$?"
+
+# other -- a real failure, and it must be visibly distinct from "nobody
+# asked": rc 4 and rc 1 must not collapse into "any nonzero is an error" on
+# the agent's side, which is exactly why 4 is carved out as its own contract.
+plant_state tmux h "$SOCK2" /tmp/t.tour "$CA/not-a-fifo"
+touch "$CA/not-a-fifo"
+"$WT" await --timeout 1 >/dev/null 2>"$CA/errX"
+rcX=$?
+if [ "$rcX" != "0" ] && [ "$rcX" != "4" ]; then other_is_distinct=0; else other_is_distinct=1; fi
+check "await: a real failure (dialog path is not a FIFO) is neither 0 nor 4" "0" "$other_is_distinct"
+case "$(cat "$CA/errX")" in
+  *"dialog channel is missing"*) check "await: the real failure names what's wrong" "0" "0" ;;
+  *) check "await: the real failure names what's wrong" "0" "1 ($(cat "$CA/errX"))" ;;
+esac
+
+rm -f "$STATE_UNDER_TEST"
+
 echo
 [ "$fail" -eq 0 ] && echo "DIALOG FIFO TESTS PASSED" || echo "DIALOG FIFO TESTS FAILED"
 exit "$fail"

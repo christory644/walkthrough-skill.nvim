@@ -64,6 +64,19 @@ jobs:
         run: ./tests/test_backend_detect.sh
       - name: cli
         run: ./tests/test_cli.sh
+      # The dialog transport. Two negative controls carry this suite: a write
+      # with no reader must return ENXIO without blocking, and every "the
+      # question arrived" assertion must distinguish arrival from a reader that
+      # was never blocked. A FIFO was chosen over a spool knowing this would be
+      # the harder thing to test honestly (docs/dialog-design.md, OQ-1), so the
+      # controls are not optional.
+      #
+      # It also pins the one platform fact the whole design rests on: a reader
+      # holding the FIFO O_RDWR measures as NO READER from the writer's side, so
+      # await.lua must open O_RDONLY|O_NONBLOCK. That is measured here on Linux
+      # as well as on the macOS reference machine.
+      - name: dialog transport
+        run: ./tests/test_dialog_fifo.sh
       # The skill bundle and the installer. install.sh is the first command
       # every user runs; this suite exercises it against a scratch HOME of its
       # own making, never the runner's.
