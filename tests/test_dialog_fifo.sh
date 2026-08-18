@@ -75,6 +75,70 @@ check "a non-blocking writer can deliver to await's reader" "OPENED" "$opened"
 wait "$RPID"; check "reader exits 0 once a question arrives" "0" "$?"
 check "reader printed the question verbatim" '{"question":"why"}' "$(cat "$WORK/q1")"
 
+# ---------------------------------------------------------------------------
+# P1 — a question with no agent attached is refused, FAST, and nothing blocks.
+#
+# Identical-if-broken: asserting only "an error was reported" passes on an
+# implementation that blocked for nine seconds first and then gave up. So the
+# assertion is on the WALL CLOCK as well as on the message.
+# ---------------------------------------------------------------------------
+cat > "$WORK/send.lua" <<'LUA'
+vim.opt.runtimepath:append(vim.env.WT_REPO)
+local channel = require("walkthrough.channel")
+local uv = vim.uv or vim.loop
+local t0 = uv.hrtime() / 1e6
+local ok, reason, msg = channel.send(_G.arg[1], _G.arg[2] or "hello")
+-- io.write, not print: nvim's `print` in --headless -l mode writes to
+-- STDERR (verified directly), not stdout, so a bare $(...) capture of it is
+-- always empty regardless of channel.lua's correctness. Every other script
+-- in this suite (await.lua, try-open.lua, validate.lua) already avoids
+-- print() for exactly this reason.
+io.write(string.format("%s|%s|%s|%.1f\n", tostring(ok), tostring(reason),
+  tostring(msg), uv.hrtime() / 1e6 - t0))
+os.exit(0)
+LUA
+res="$(WT_REPO="$REPO" nvim --headless --clean -l "$WORK/send.lua" "$FIFO")"
+check "no reader: send refuses"        "false"     "$(echo "$res" | cut -d'|' -f1)"
+check "no reader: reason is no_reader" "no_reader" "$(echo "$res" | cut -d'|' -f2)"
+case "$(echo "$res" | cut -d'|' -f3)" in
+  *"no agent is listening"*) check "no reader: the message names it" "0" "0" ;;
+  *) check "no reader: the message names it" "0" "1 ($res)" ;;
+esac
+took="$(echo "$res" | cut -d'|' -f4)"
+awk -v t="$took" 'BEGIN { exit !(t < 100) }'
+check "no reader: refused in under 100ms (took ${took}ms)" "0" "$?"
+
+# The negative control the design mandates: with the non-blocking flag removed,
+# the SAME write must hang. Without this, "it returned quickly" is a claim about
+# nothing — it would read the same on a platform where the flag does not matter.
+cat > "$WORK/blocking.lua" <<'LUA'
+local uv = vim.uv or vim.loop
+uv.fs_open(_G.arg[1], uv.constants.O_WRONLY, tonumber("600", 8))
+print("RETURNED")
+os.exit(0)
+LUA
+nvim --headless --clean -l "$WORK/blocking.lua" "$FIFO" > "$WORK/blocked" 2>&1 &
+BPID=$!; PIDS+=("$BPID")
+n=0; while [ "$n" -lt 400000 ]; do n=$((n + 1)); done
+kill -0 "$BPID" 2>/dev/null
+check "control: WITHOUT O_NONBLOCK the same open hangs" "0" "$?"
+check "control: and it printed nothing"                 "0" "$(wc -c < "$WORK/blocked" | tr -d ' ')"
+# -9, not a plain TERM: verified directly on this machine that a process
+# blocked in a synchronous open(2) on a FIFO with no reader does not respond
+# to SIGTERM (open() is restarted after EINTR), so a plain `kill` here would
+# leave this reap — and the whole suite — hanging forever.
+kill -9 "$BPID" 2>/dev/null; wait "$BPID" 2>/dev/null
+
+# A question longer than the cap is refused before any fd is opened. Issue #11
+# notes no field in this project has a size limit; this one does, because on a
+# non-blocking fd a write past PIPE_BUF may be short, and a short write must be
+# reported rather than retried — retrying is how a non-blocking writer talks
+# itself back into blocking.
+big="$(awk 'BEGIN { for (i = 0; i < 3000; i++) printf "x" }')"
+res="$(WT_REPO="$REPO" nvim --headless --clean -l "$WORK/send.lua" "$FIFO" "$big")"
+check "oversized question: refused" "false"    "$(echo "$res" | cut -d'|' -f1)"
+check "oversized question: reason"  "too_long" "$(echo "$res" | cut -d'|' -f2)"
+
 echo
 [ "$fail" -eq 0 ] && echo "DIALOG FIFO TESTS PASSED" || echo "DIALOG FIFO TESTS FAILED"
 exit "$fail"
