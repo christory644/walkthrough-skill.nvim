@@ -134,10 +134,32 @@ kill -9 "$BPID" 2>/dev/null; wait "$BPID" 2>/dev/null
 # non-blocking fd a write past PIPE_BUF may be short, and a short write must be
 # reported rather than retried — retrying is how a non-blocking writer talks
 # itself back into blocking.
+#
+# A live reader is attached first so ok=false can only mean too_long: with no
+# reader at all, ok=false is also exactly what no_reader looks like, and
+# "refused" below could not tell the two apart (caught in review — reverting
+# MAX_BYTES alone produced only 1 FAIL, not 2, because this check was
+# decorative). Nothing is ever delivered to this reader — the oversized send
+# is refused before any fd is opened — so it is reaped by PID right after,
+# not left to run out its budget.
+nvim --headless --clean -l "$REPO/lua/walkthrough/await.lua" "$FIFO" 5000 "$WORK/ready2" \
+  > "$WORK/q2" 2>/dev/null &
+OPID=$!; PIDS+=("$OPID")
+n=0; while [ ! -f "$WORK/ready2" ] && [ "$n" -lt 200000 ]; do n=$((n + 1)); done
+kill -0 "$OPID" 2>/dev/null; check "oversized question: reader is attached before the send" "0" "$?"
+
 big="$(awk 'BEGIN { for (i = 0; i < 3000; i++) printf "x" }')"
 res="$(WT_REPO="$REPO" nvim --headless --clean -l "$WORK/send.lua" "$FIFO" "$big")"
 check "oversized question: refused" "false"    "$(echo "$res" | cut -d'|' -f1)"
 check "oversized question: reason"  "too_long" "$(echo "$res" | cut -d'|' -f2)"
+
+# Reap: a plain TERM is enough here (the reader is parked in a sleep loop, not
+# a blocking syscall — unlike the O_WRONLY control above, which is why that
+# one needed -9), but escalate if it somehow doesn't go down.
+kill "$OPID" 2>/dev/null
+n=0; while kill -0 "$OPID" 2>/dev/null && [ "$n" -lt 50 ]; do n=$((n + 1)); sleep 0.1; done
+kill -0 "$OPID" 2>/dev/null && kill -9 "$OPID" 2>/dev/null
+wait "$OPID" 2>/dev/null
 
 echo
 [ "$fail" -eq 0 ] && echo "DIALOG FIFO TESTS PASSED" || echo "DIALOG FIFO TESTS FAILED"
