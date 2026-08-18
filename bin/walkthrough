@@ -547,6 +547,35 @@ cmd_await() {
     "$ST_dialog" "$((budget * 1000))"
 }
 
+# The answer crosses as base64 behind a FIXED verb — never an expression.
+# `walkthrough step` used to interpolate its argument, so
+# `walkthrough step '<any vimscript>'` ran in the tour's nvim; that is the
+# precedent this is written against, and an answer is strictly more dangerous
+# because it is agent-authored text rather than a number.
+cmd_answer() {
+  local nonce="" text bytes
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --nonce) shift; nonce="${1:-}" ;;
+      *) die "answer takes --nonce <nonce>, with the answer on stdin (got: $1)" ;;
+    esac
+    shift
+  done
+  [ -n "$nonce" ] || die "answer needs --nonce <nonce> (it is in the question)"
+  # Past this test the nonce is provably [A-Za-z0-9-], so it cannot close a
+  # quote or introduce a token — the same argument cmd_step makes for its
+  # integer, and stronger than escaping for the same reason.
+  case "$nonce" in *[!A-Za-z0-9-]*) die "that is not a nonce: $nonce" ;; esac
+  with_state
+  text="$(cat)"
+  [ -n "$text" ] || die "the answer is empty (it is read from stdin)"
+  bytes="$(printf %s "$text" | wc -c | tr -d ' ')"
+  [ "$bytes" -le 16384 ] || die "the answer is too long ($bytes bytes; the limit is 16384)"
+  remote_expr "$(printf "luaeval('%s', ['%s','%s'])" \
+    '(function(a) local d = vim.base64.decode require("walkthrough")._answer(d(a[1]), d(a[2])) return 1 end)(_A)' \
+    "$(b64 "$nonce")" "$(b64 "$text")")"
+}
+
 usage() {
   cat <<'EOF'
 walkthrough — play guided code tours in nvim
@@ -557,6 +586,7 @@ walkthrough — play guided code tours in nvim
   walkthrough close                end the walkthrough
   walkthrough await [--timeout N]  wait for a question from the walkthrough
                                    (exit 4 = nobody asked; default 90s)
+  walkthrough answer --nonce N     answer the waiting question (read from stdin)
   walkthrough list [dir]           list tours (default: <workspace root>/.tours/)
   walkthrough validate <tour>...   exit 0 only if every tour is playable,
                                    reporting the line each pattern resolved to
@@ -586,6 +616,7 @@ case "${1:-}" in
   reload) shift; cmd_reload "$@" ;;
   close) shift; cmd_close "$@" ;;
   await) shift; cmd_await "$@" ;;
+  answer) shift; cmd_answer "$@" ;;
   list) shift; cmd_list "$@" ;;
   validate) shift; cmd_validate "$@" ;;
   schema) cmd_schema ;;

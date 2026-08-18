@@ -2,6 +2,7 @@ local tour_mod = require("walkthrough.tour")
 local render   = require("walkthrough.render")
 local nav      = require("walkthrough.nav")
 local keys_mod = require("walkthrough.keys")
+local dialog   = require("walkthrough.dialog")
 
 local M = {}
 
@@ -302,6 +303,25 @@ function M.reload(path_or_tour)
   end
   goto_id(previous)
   return M.state()
+end
+
+-- The inbound leg, and it is the dangerous one: agent-authored text arriving on
+-- a channel that can execute arbitrary Lua.
+--
+-- Three rules, matching the three at the top of bin/walkthrough:
+--   1. The text crossed as base64 and was decoded by vim.base64.decode on this
+--      side. It is never interpolated into the expression.
+--   2. The transport carries DATA plus a fixed verb — this function — never an
+--      expression. There is no way to evaluate Lua in the player as part of
+--      answering.
+--   3. It reaches the buffer through nvim_buf_set_lines, never through :put,
+--      execute, or anything that reads it as a command.
+--
+-- Underscore-prefixed because it is the CLI's entry point, not a public API.
+function M._answer(nonce, text)
+  local ok, reason = dialog.answer(nonce, text)
+  if not ok then error(reason, 0) end
+  return true
 end
 
 function M.close()
