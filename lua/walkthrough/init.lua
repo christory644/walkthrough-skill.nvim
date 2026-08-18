@@ -149,11 +149,13 @@ end
 -- running in. Shared by close() and by the one abort path in open(), which
 -- must not leave a half-open walkthrough behind.
 local function teardown()
-  -- The dialog is closed explicitly rather than by riding on state.touched.
+  -- The dialog is closed here rather than by riding on state.touched.
   -- Registering it there would put it in M.reload's `silent! edit!` loop, which
   -- is wrong for a prompt buffer and would destroy a transcript the reload was
-  -- very likely CAUSED by -- an answer that rewrote the tour. Explicit here,
-  -- explicit in reload, and nothing is leaked either way.
+  -- very likely CAUSED by -- an answer that rewrote the tour. So `reload` does
+  -- NOT close it: it keeps the dialog and tells it the tour changed
+  -- (`dialog.on_reload`). This is the only place it is closed, and nothing is
+  -- leaked either way.
   dialog.close()
   for b in pairs(state.touched) do
     if vim.api.nvim_buf_is_valid(b) then

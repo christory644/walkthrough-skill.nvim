@@ -155,11 +155,14 @@ pending window is cancellable, and no probe means nothing to disagree with the
 send), not something physics forced.*
 
 **The dialog buffer is not in `state.touched`.** `docs/dialog-design.md` § 3
-says it should be, so that `teardown` finds it. It is closed explicitly instead,
-from `teardown` and from `M.reload`, because `reload` runs `silent! edit!` over
-every buffer in `state.touched` — wrong for a `buftype=prompt` buffer, and it
-would destroy a transcript the reload was very likely caused by. An answer that
-rewrites the tour goes through `reload`; the dialog has to survive it.
+says it should be, so that `teardown` finds it. It is closed explicitly from
+`teardown` instead — the one place it is closed — because `reload` runs
+`silent! edit!` over every buffer in `state.touched`, which is wrong for a
+`buftype=prompt` buffer and would destroy a transcript the reload was very
+likely caused by. So `M.reload` does not close it at all: it keeps the dialog
+and calls `dialog.on_reload`, which notes the change in the transcript. An
+answer that rewrites the tour goes through `reload`; the dialog has to survive
+it.
 
 **A socket path over 104 characters is refused, not truncated.** Past that
 length, nvim silently truncates the path to fit `sun_path` and binds the socket
