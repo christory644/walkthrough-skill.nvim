@@ -90,7 +90,32 @@ local function session_cleanup()
   end
 end
 
+-- The removal hook belongs to the PROCESS, not to the tour. It used to live in
+-- state.augroup, which `teardown` deletes -- so any path that tore a walkthrough
+-- down without following it with session_cleanup() left nvim alive with nothing
+-- to unlink the FIFO on exit. M.reload's double-failure branch is exactly that
+-- path: it tears down, and by then state.active is false, so a later M.close()
+-- returns early without cleaning up either. The reader `:qa!`s and the FIFO, the
+-- socket and the state file all survive -- the leak #30 exists to prevent.
+--
+-- Unlinking on the spot would be the wrong repair: this nvim is still alive and
+-- still listening on that socket, and the state file is how the CLI finds it, so
+-- the files are still in use. They stop being in use when the process does.
+-- Installed once, in its own group, and never cleared.
+local cleanup_group
+local function install_session_cleanup()
+  if cleanup_group then return end
+  cleanup_group = vim.api.nvim_create_augroup("WalkthroughSession", { clear = true })
+  -- The exit that never reaches M.close: `:qa!`, or the surface being killed
+  -- out from under us. Unlinking is synchronous, so it completes before we go.
+  vim.api.nvim_create_autocmd("VimLeavePre", {
+    group = cleanup_group,
+    callback = session_cleanup,
+  })
+end
+
 local function install_autocmd()
+  install_session_cleanup()
   state.augroup = vim.api.nvim_create_augroup("Walkthrough", { clear = true })
   vim.api.nvim_create_autocmd("BufEnter", {
     group = state.augroup,
@@ -112,12 +137,6 @@ local function install_autocmd()
         end
       end
     end,
-  })
-  -- The exit that never reaches M.close: `:qa!`, or the surface being killed
-  -- out from under us. Unlinking is synchronous, so it completes before we go.
-  vim.api.nvim_create_autocmd("VimLeavePre", {
-    group = state.augroup,
-    callback = session_cleanup,
   })
 end
 

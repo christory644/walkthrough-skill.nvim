@@ -1434,6 +1434,60 @@ check "VimLeavePre removes the state file on :qa!" "1" "$leak_rc"
 if [ -e "$LEAK/sock2" ]; then leak_rc=0; else leak_rc=1; fi
 check "VimLeavePre removes the socket on :qa!" "1" "$leak_rc"
 
+# ...and on the path that tears a walkthrough down while leaving nvim ALIVE.
+#
+# Whole-branch review, F4: teardown() deletes state.augroup, which used to hold
+# the VimLeavePre hook. M.reload's double-failure branch (the new tour will not
+# open AND the previous one cannot be restored) runs teardown with no
+# session_cleanup after it, and state.active is false by then, so a later
+# M.close() returns early without cleaning up either. The reader is left in a
+# live nvim whose exit unlinks nothing.
+#
+# Identical-if-broken: asserting that the reload FAILED passes either way -- it
+# failed on the fixed build too. The discriminating assertion is that the files
+# are gone after the process exits, so this drives the branch and then `:qa!`s.
+# The FIFO is included because it is the object the dialog design exists to
+# avoid leaving behind with no reader.
+touch "$LEAK/state3" "$LEAK/sock3"
+mkfifo -m 600 "$LEAK/fifo3"
+mkdir -p "$LEAK/doomed"
+cp "$REPO/tests/fixtures/alpha.txt" "$LEAK/doomed/alpha.txt"
+printf '%s\n' '{ "title": "doomed", "steps": [
+  { "title": "s1", "file": "alpha.txt", "line": 1, "description": "d" } ] }' \
+  > "$LEAK/doomed/t.tour"
+cat > "$LEAK/double.lua" <<'LUA'
+vim.opt.runtimepath:append(vim.env.WT_REPO)
+vim.env.WALKTHROUGH_STATE  = vim.env.WT_STATE
+vim.env.WALKTHROUGH_SOCKET = vim.env.WT_SOCKET
+vim.env.WALKTHROUGH_DIALOG = vim.env.WT_DIALOG
+local wt = require("walkthrough")
+wt.setup({ close_surface = false })
+wt.open(vim.env.WT_TOUR)
+-- Make the walkthrough that is currently playing unrestorable: its only file
+-- goes away, so re-opening the previous tour fails the same way the new one is
+-- about to.
+os.remove(vim.env.WT_DOOMED)
+local ok, err = pcall(wt.reload, { title = "will not play", steps = {
+  { title = "gone", file = "/nonexistent/nowhere.txt", line = 1, description = "d" },
+} })
+local f = io.open(vim.env.WT_OUT, "w")
+f:write(tostring(ok) .. "|" .. tostring(err))
+f:close()
+vim.cmd("qa!")
+LUA
+( cd "$LEAK/doomed" && WT_REPO="$REPO" WT_STATE="$LEAK/state3" WT_SOCKET="$LEAK/sock3" \
+    WT_DIALOG="$LEAK/fifo3" WT_TOUR="$LEAK/doomed/t.tour" \
+    WT_DOOMED="$LEAK/doomed/alpha.txt" WT_OUT="$LEAK/double.out" \
+    nvim --headless --clean -l "$LEAK/double.lua" >/dev/null 2>&1 )
+grep -q 'could not be restored' "$LEAK/double.out"
+check "the double-failure reload branch was really taken" "0" "$?"
+if [ -e "$LEAK/state3" ]; then leak_rc=0; else leak_rc=1; fi
+check "...and :qa! still removes the state file afterwards" "1" "$leak_rc"
+if [ -e "$LEAK/sock3" ]; then leak_rc=0; else leak_rc=1; fi
+check "...and the socket" "1" "$leak_rc"
+if [ -e "$LEAK/fifo3" ]; then leak_rc=0; else leak_rc=1; fi
+check "...and the FIFO" "1" "$leak_rc"
+
 # The guard that keeps this from becoming a delete-anything primitive: with no
 # env injected, nothing is unlinked.
 touch "$LEAK/bystander"
