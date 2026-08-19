@@ -95,7 +95,7 @@ local function make_buffer()
     end,
   })
 
-  vim.fn.prompt_setcallback(buf, function(text) M.submit(text) end)
+  vim.fn.prompt_setcallback(buf, function(text) M.submit(text, true) end)
   return buf
 end
 
@@ -598,7 +598,38 @@ function M.clear_prompt()
     { vim.fn.prompt_getprompt(S.buf) })
 end
 
-function M.submit(text)
+-- `from_keystroke` is true only when this runs as the prompt buffer's own
+-- callback (wired below in make_buffer). It exists to undo something nvim did
+-- to the buffer a moment ago, not something ours: the instant Enter fires on
+-- a buftype=prompt buffer, nvim itself commits the just-typed line into the
+-- buffer as fixed history (prompt prefix and all) and opens a fresh blank
+-- prompt line below it -- BEFORE this callback ever runs (measured: by the
+-- time M.submit is entered, that history line is already there). Left alone,
+-- every question would appear twice: once as nvim's own history line, once as
+-- the "you: ..." line M.append writes below under our control once the send
+-- is known to have gone through (or, refused, once more as the text put back
+-- in the prompt line for editing).
+--
+-- So nvim's copy is removed here, always the second-to-last buffer line at
+-- this exact moment -- position, not content, is what identifies it, because
+-- it holds regardless of what `text` says or what sat above it. This runs
+-- BEFORE anything else, even the empty-string and control-character
+-- early-returns below, so a rejected or blank Enter leaves no orphaned echo
+-- of its own either.
+--
+-- Guarded on `from_keystroke`: a programmatic call (M.submit invoked
+-- directly, as most of the test suite and the auto-send retry in `attempt`
+-- do) never went through nvim's commit machinery, so there is no such line to
+-- remove -- deleting "the second-to-last line" unconditionally there would
+-- delete real transcript content instead.
+function M.submit(text, from_keystroke)
+  if from_keystroke and M.has_buffer() then
+    local n = vim.api.nvim_buf_line_count(S.buf)
+    if n >= 2 then
+      vim.api.nvim_buf_set_lines(S.buf, n - 2, n - 1, false, {})
+    end
+  end
+
   text = vim.trim(tostring(text or ""))
   if text == "" then return end
 

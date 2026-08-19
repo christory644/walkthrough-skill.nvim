@@ -683,4 +683,82 @@ local d2b = sent_payload("and now?")
 T.eq(d2b.index, 2, "after the agent's own step +1, a new question is tagged step 2")
 wt.close()
 
+-- ---------------------------------------------------------------------------
+-- D3 (implementation-plan report) — a question typed at the prompt must not
+-- be echoed twice.
+--
+-- buftype=prompt commits the just-typed line into the buffer as fixed history
+-- the INSTANT Enter fires -- before prompt_setcallback's own function body
+-- ever runs (measured) -- and M.send_now separately appends its own
+-- "you: ..." line once the send is known to have gone through. Every
+-- assertion above this one reaches M.submit by calling dialog.submit()
+-- directly from Lua, which never passes through nvim's commit machinery at
+-- all -- so none of them can see this defect; it only exists on the path a
+-- REAL keystroke takes. This drives that path: nvim_feedkeys into the
+-- dialog's own window, never dialog.submit(), or it proves nothing.
+-- ---------------------------------------------------------------------------
+-- <Esc> and "A<text><CR>" are fed as TWO separate nvim_feedkeys calls, not
+-- one: fed together, nvim's terminal input parsing reads <Esc>A as a single
+-- meta-keystroke (many terminals send Alt-A that way) rather than "leave
+-- insert mode, then append" -- measured, the giveaway being the callback
+-- receiving literal text "A" (or, with a real question after it, missing the
+-- question's own first character to the same coalescing). A short vim.wait
+-- between the two keeps them from being read as one.
+local function type_and_enter(text)
+  vim.api.nvim_set_current_win(dialog.winid())
+  vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<Esc>", true, false, true), "x", false)
+  vim.wait(30)
+  vim.api.nvim_feedkeys(
+    vim.api.nvim_replace_termcodes("A" .. text .. "<CR>", true, false, true), "x", false)
+  vim.wait(200)
+end
+
+local function count_lines_containing(buf, needle)
+  local n = 0
+  for _, l in ipairs(vim.api.nvim_buf_get_lines(buf, 0, -1, false)) do
+    if l:find(needle, 1, true) then n = n + 1 end
+  end
+  return n
+end
+
+wt.open("tests/fixtures/two_files.tour")
+wt.ask()
+local real_send3 = channel.send
+channel.send = function(_p, _payload) return true end
+type_and_enter("and what stops a hostile answer running as lua")
+channel.send = real_send3
+
+local NEEDLE = "hostile answer running as lua"
+T.eq(count_lines_containing(dialog.bufnr(), NEEDLE), 1,
+  "a typed question appears in the transcript exactly once, not twice")
+T.ok(vim.iter(vim.api.nvim_buf_get_lines(dialog.bufnr(), 0, -1, false)):any(function(l)
+  return l:match("^you: ") ~= nil and l:find(NEEDLE, 1, true) ~= nil
+end), "...and the surviving line is OUR controlled echo, prefixed \"you: \"")
+wt.close()
+
+-- Refused-and-queued: the text is written back into the (now editable) prompt
+-- line so the reader can cancel or edit it -- see M.on_refused -- and that
+-- must be the ONLY place it appears while queued, not also sitting in
+-- history.
+wt.open("tests/fixtures/two_files.tour")
+wt.ask()
+local real_send4 = channel.send
+channel.send = function(_p, _payload) return false, "no_reader", "no agent is listening" end
+type_and_enter("does anyone answer this one")
+channel.send = real_send4
+
+T.eq(count_lines_containing(dialog.bufnr(), "does anyone answer this one"), 1,
+  "a refused-and-queued question also appears exactly once (in the editable prompt line)")
+dialog.cancel_pending(true)
+wt.close()
+
+-- A plain, empty Enter leaves no orphan history line of its own either.
+wt.open("tests/fixtures/two_files.tour")
+wt.ask()
+local before_blank = vim.api.nvim_buf_line_count(dialog.bufnr())
+type_and_enter("")
+T.eq(vim.api.nvim_buf_line_count(dialog.bufnr()), before_blank,
+  "an empty Enter changes nothing in the transcript")
+wt.close()
+
 T.done()
