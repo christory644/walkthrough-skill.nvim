@@ -41,8 +41,23 @@ function M.attach(bufnr, keys)
 end
 
 -- The dialog's own buffer-local bindings. Separate from M.attach because the
--- dialog is not a tour buffer: it must never carry the step keys (they would
--- fight the prompt) and it must never enter state.touched.
+-- dialog is not a tour buffer: it must never carry the step-navigation keys
+-- (they would fight the prompt -- the owner was explicit that `]`/`[` are
+-- motion prefixes while the reader is composing, so `next`/`prev`/`next_cmd`/
+-- `prev_cmd` only fire when the dialog is NOT focused) and it must never
+-- enter state.touched.
+--
+-- Three keys DO belong here, each for its own reason:
+--   dialog_close -- dismisses the panel. Unchanged from before this revision.
+--   close        -- ending the walkthrough is a global act (the owner's
+--                    ruling, overturning the earlier "document, don't bind"
+--                    call): the reader should not have to leave the dialog
+--                    first just to find the key that works. Calls the same
+--                    wt.close() a tour buffer's `close` calls.
+--   ask          -- pressing it again while already IN the dialog is not a
+--                    no-op: dialog.open's own reopen branch (M.is_open() ==
+--                    true) refreshes S.ctx, focuses the window and starts
+--                    insert -- a sensible "get me back to typing" action.
 --
 -- The binding is REPLACED on every open, not added to. The dialog's buffer
 -- survives a dismissal and is reused by the next open (that is what keeps the
@@ -54,18 +69,43 @@ end
 -- What was really bound is recorded ON the buffer rather than recomputed from
 -- config, the same discipline `state.attached` keeps for tour buffers: config
 -- can change between the bind and the unbind, and the unbind has to remove what
--- is actually there.
+-- is actually there. Plural now (a table of name -> lhs, not one string),
+-- since three keys can live here instead of one.
 function M.attach_dialog(bufnr, keys)
-  local prior = vim.b[bufnr].walkthrough_dialog_key
-  if type(prior) == "string" and prior ~= "" then
-    pcall(vim.keymap.del, "n", prior, { buffer = bufnr })
+  local wt = require("walkthrough")
+  local dlg = require("walkthrough.dialog")
+
+  local prior = vim.b[bufnr].walkthrough_dialog_keys
+  if type(prior) == "table" then
+    for _, lhs in pairs(prior) do
+      if type(lhs) == "string" and lhs ~= "" then
+        pcall(vim.keymap.del, "n", lhs, { buffer = bufnr })
+      end
+    end
   end
-  vim.b[bufnr].walkthrough_dialog_key = nil
-  local lhs = keys.dialog_close
-  if not lhs or lhs == "" then return end
-  vim.keymap.set("n", lhs, function() require("walkthrough.dialog").dismiss() end,
-    { buffer = bufnr, silent = true, desc = "walkthrough: dismiss the dialog" })
-  vim.b[bufnr].walkthrough_dialog_key = lhs
+  vim.b[bufnr].walkthrough_dialog_keys = nil
+
+  local bound = {}
+  local map = function(name, lhs, fn, desc)
+    if lhs and lhs ~= "" then
+      vim.keymap.set("n", lhs, fn, { buffer = bufnr, silent = true, desc = desc })
+      bound[name] = lhs
+    end
+  end
+
+  map("dialog_close", keys.dialog_close, function() dlg.dismiss() end,
+    "walkthrough: dismiss the dialog")
+  map("close", keys.close, function() wt.close() end, "walkthrough: end the walkthrough")
+  map("ask", keys.ask, function() wt.ask() end, "walkthrough: ask about this step")
+  vim.b[bufnr].walkthrough_dialog_keys = bound
+
+  -- Same coherence rule as M.attach's group registration below: register it
+  -- if EITHER <leader>a-shaped key actually landed on this buffer.
+  local ok, wk = pcall(require, "which-key")
+  local under_a = function(k) return type(k) == "string" and k:match("^<leader>a") ~= nil end
+  if ok and wk.add and (under_a(keys.close) or under_a(keys.ask)) then
+    wk.add({ { "<leader>a", group = "agent", buffer = bufnr } })
+  end
 end
 
 function M.detach(bufnr, keys)

@@ -561,6 +561,164 @@ wt.close()
 require("walkthrough").setup({ keys = { dialog_close = "q" } })
 
 -- ---------------------------------------------------------------------------
+-- Owner's ruling, overturning the earlier D4 "document, don't bind" call —
+-- each key has a scope, decided on purpose rather than left as an accident of
+-- which buffer happened to get which map. The matrix:
+--
+--   next/prev/next_cmd/prev_cmd -- tour (code) buffers ONLY. Never the dialog:
+--     the reader is composing there, and `]`/`[` are motion prefixes.
+--   close (<leader>aq)          -- EVERYWHERE the walkthrough owns: tour
+--     buffers AND the dialog. Ending the walkthrough is a global act; the
+--     reader should not have to leave the dialog first to find the key.
+--   ask (<leader>aa)            -- tour buffers AND the dialog. On a tour
+--     buffer it opens the dialog; pressed again from INSIDE the dialog it is
+--     not a no-op -- dialog.open's own reopen branch (M.is_open() == true)
+--     refreshes S.ctx, focuses the window and starts insert.
+--   dialog_close (q)            -- the dialog ONLY, never a tour buffer
+--     (unchanged; regression 2, above, already guards it).
+--
+-- The quickfix window is deliberately left OUT of this matrix entirely, code
+-- and tests both -- see the block below the matrix assertion for why.
+-- ---------------------------------------------------------------------------
+local LEADER = vim.g.mapleader or "\\"
+local KEY_LHS = {
+  next = "]w", prev = "[w",
+  next_cmd = LEADER .. "an", prev_cmd = LEADER .. "ap",
+  close = LEADER .. "aq", ask = LEADER .. "aa",
+  dialog_close = "q",
+}
+local function bound_names(buf)
+  local lhs_set = {}
+  for _, m in ipairs(vim.api.nvim_buf_get_keymap(buf, "n")) do lhs_set[m.lhs] = true end
+  local present = {}
+  for name, lhs in pairs(KEY_LHS) do
+    if lhs_set[lhs] then table.insert(present, name) end
+  end
+  table.sort(present)
+  return present
+end
+
+wt.open("tests/fixtures/two_files.tour")
+local matrix_tour_buf = vim.api.nvim_get_current_buf()
+T.eq(bound_names(matrix_tour_buf), { "ask", "close", "next", "next_cmd", "prev", "prev_cmd" },
+  "tour-buffer matrix: navigation + close + ask, and NOT dialog_close")
+
+wt.ask()
+local matrix_dlg_buf = dialog.bufnr()
+T.eq(bound_names(matrix_dlg_buf), { "ask", "close", "dialog_close" },
+  "dialog matrix: close + ask + dialog_close, and NOT any navigation key")
+wt.close()
+
+-- Prove it, not just find it bound: <leader>aq fired FOR REAL from inside the
+-- dialog must actually tear the walkthrough down. This is the reentrant case
+-- a "the mapping exists" check cannot see -- M.close() force-deletes the
+-- dialog's own buffer from inside a keymap callback that buffer itself fired.
+wt.open("tests/fixtures/two_files.tour")
+wt.ask()
+T.ok(wt.state().active, "the walkthrough is active before <leader>aq")
+vim.api.nvim_set_current_win(dialog.winid())
+vim.cmd("stopinsert")
+local close_ok = pcall(function()
+  vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes(LEADER .. "aq", true, false, true), "x", false)
+end)
+vim.wait(200)
+T.ok(close_ok, "<leader>aq fired from inside the dialog does not raise")
+T.ok(not wt.state().active, "...and the walkthrough actually tears down")
+T.ok(not dialog.is_open(), "...taking the dialog with it")
+
+-- <leader>aa from inside the dialog is a sensible action, checked against the
+-- code rather than assumed: dialog.open's reopen branch refreshes the (D2)
+-- context and keeps the reader in the dialog, ready to type.
+--
+-- The winbar/focus checks below are NOT, on their own, identical-if-broken
+-- safe: D2's own dialog.update_ctx already keeps the winbar correct on every
+-- wt.step(1), whether or not this key is bound at all, so a build that never
+-- called wt.ask() from here would still pass them. What actually distinguishes
+-- "the keymap really invokes M.ask()" from "nothing happened, and the dialog
+-- already looked fine" is the spy: `wt.ask` is a field on the module table
+-- captured by reference (`local wt = require("walkthrough")` in
+-- attach_dialog), so replacing it here is visible to the keymap's own closure.
+wt.open("tests/fixtures/two_files.tour")
+wt.ask()
+wt.step(1)  -- move on with the dialog still open, same scenario D2 guards
+vim.api.nvim_set_current_win(dialog.winid())
+vim.cmd("stopinsert")
+local real_ask = wt.ask
+local ask_called = false
+wt.ask = function(...) ask_called = true return real_ask(...) end
+local ask_ok = pcall(function()
+  vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes(LEADER .. "aa", true, false, true), "x", false)
+end)
+vim.wait(200)
+wt.ask = real_ask
+T.ok(ask_ok, "<leader>aa fired from inside the dialog does not raise")
+T.ok(ask_called, "...and it actually calls M.ask(), not just something that happens to look the same")
+T.ok(dialog.is_open(), "...the dialog is still open")
+T.eq(vim.api.nvim_get_current_win(), dialog.winid(), "...focus stays in the dialog")
+T.ok(tostring(vim.wo[dialog.winid()].winbar):find(wt.state().id, 1, true) ~= nil,
+  "...and its context is refreshed to the CURRENT step, not the stale one")
+wt.close()
+
+-- The disable-with-"" and rebind-REPLACES contracts extend to `close` and
+-- `ask` on the dialog exactly as they already held for `dialog_close`
+-- (regression 2, above) -- asserted on a REUSED buffer, which is where
+-- "replace, not accumulate" broke before.
+require("walkthrough").setup({ keys = { close = KEY_LHS.close, ask = KEY_LHS.ask } })
+wt.open("tests/fixtures/two_files.tour")
+wt.ask()
+local reused2 = dialog.bufnr()
+local bound_lhs_by_desc = function(desc_substr)
+  local out = {}
+  for _, m in ipairs(vim.api.nvim_buf_get_keymap(reused2, "n")) do
+    if tostring(m.desc or ""):find(desc_substr, 1, true) then table.insert(out, m.lhs) end
+  end
+  table.sort(out)
+  return out
+end
+T.eq(bound_lhs_by_desc("end the walkthrough"), { KEY_LHS.close },
+  "close is bound on a fresh dialog open")
+redismiss()
+require("walkthrough").setup({ keys = { close = "Z" } })
+wt.ask()
+T.eq(dialog.bufnr(), reused2, "still the same reused buffer")
+T.eq(bound_lhs_by_desc("end the walkthrough"), { "Z" },
+  "rebinding close REPLACES it, not adds to it")
+redismiss()
+require("walkthrough").setup({ keys = { close = "" } })
+wt.ask()
+T.eq(bound_lhs_by_desc("end the walkthrough"), {}, '...and "" disables it, on the reused buffer')
+-- ask, same contract, same buffer, same pass.
+T.eq(bound_lhs_by_desc("ask about this step"), { KEY_LHS.ask },
+  "ask is unaffected by close's own setup{} call")
+redismiss()
+require("walkthrough").setup({ keys = { ask = "" } })
+wt.ask()
+T.eq(bound_lhs_by_desc("ask about this step"), {}, '...and "" disables ask too, on the reused buffer')
+wt.close()
+require("walkthrough").setup({ keys = { close = KEY_LHS.close, ask = KEY_LHS.ask } })
+
+-- The quickfix window is deliberately left OUT of the matrix: it is not a
+-- buffer the walkthrough creates or reliably owns. `nav.is_our_qflist` exists
+-- precisely because a reader's `:grep` can silently repoint the SAME global
+-- qf buffer away from us mid-tour, with no hook (unlike state.touched's
+-- BufEnter/teardown pairing, or the dialog's own attach-on-every-open plus
+-- M.close's outright buffer deletion) that would let a keymap bound there be
+-- removed at that moment. A stale <leader>aq left behind would fire in the
+-- READER'S OWN qf window after they took the list back, on a key they never
+-- asked this plugin to claim -- content only (nav.populate,
+-- mark_dropped_in_qflist), never a keymap.
+vim.cmd("only")
+wt.open("tests/fixtures/two_files.tour")
+vim.cmd("topleft copen")
+local qfw = vim.api.nvim_get_current_win()
+local qfb = vim.api.nvim_win_get_buf(qfw)
+T.eq(vim.bo[qfb].buftype, "quickfix", "the tour's table of contents is open")
+T.eq(vim.api.nvim_buf_get_keymap(qfb, "n"), {},
+  "the quickfix buffer carries no walkthrough keymap at all")
+vim.cmd("cclose")
+wt.close()
+
+-- ---------------------------------------------------------------------------
 -- F3 (Important) — two questions in flight.
 --
 -- W was a single slot and mark_waiting stopped the previous watchdog, so the
