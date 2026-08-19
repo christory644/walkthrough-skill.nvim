@@ -146,7 +146,7 @@ Once a walkthrough is open, in nvim:
 | `<leader>an` / `<leader>ap` | next / previous step |
 | `<leader>aa` | ask about this step |
 | `q` | dismiss the question panel (in the panel; `<leader>aa` brings it back, with the conversation still in it) |
-| `<leader>aq` | end the walkthrough |
+| `<leader>aq` | end the walkthrough (from a code window — the panel is a text-entry surface with no normal-mode walkthrough keys of its own; press `q` there first) |
 | `:copen` | the whole tour as a list |
 
 The player is a real nvim running your own config, not a viewer that imitates
