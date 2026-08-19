@@ -635,8 +635,35 @@ function M.submit(text, from_keystroke)
 
   -- Refused at the buffer, before anything is framed: control characters and
   -- NUL have no meaning in a question and a NUL cannot survive the round trip.
+  --
+  -- Review, Important -- this used to leave the reader with NOTHING: a generic
+  -- warning and a bare prompt line, the typed text gone. That is a regression
+  -- D3's own fix introduced (nvim's own history line at least kept a visible
+  -- copy on screen before it was deleted here), and it is the WORSE of the
+  -- two refusal paths' behaviour on exactly the case most likely to trigger
+  -- it -- a paste. The no-reader refusal in `M.on_refused` has the right
+  -- model: put the text back in the (now editable) prompt line, so it is
+  -- recoverable rather than lost. Match it here.
+  --
+  -- The raw text cannot go back verbatim, though: this guard deliberately
+  -- lets \n and \t through (a question is allowed to be multi-line), so text
+  -- reaching here can carry a real embedded newline alongside whatever
+  -- actually tripped the guard -- and a buffer's PROMPT is a single line;
+  -- nvim_buf_set_lines refuses one array element that embeds a newline, the
+  -- same defect M.send_now's echo had (see its own comment). So: strip the
+  -- rejected characters (only those -- \n and \t are not among them, and stay
+  -- exactly as typed), then flatten any embedded newline left over into a
+  -- space so the result is restorable on one line. The reader gets their
+  -- question back, valid, one Enter away, rather than a blank line and a
+  -- vague warning with no way to tell what was wrong or recover it.
   if text:find("[%z\1-\8\11\12\14-\31]") then
-    M.append({ "walkthrough: a question cannot contain control characters." }, "WarningMsg")
+    local cleaned = text:gsub("[%z\1-\8\11\12\14-\31]", ""):gsub("[\r\n]", " ")
+    M.append({
+      "walkthrough: a question cannot contain control characters — they were",
+      "  removed and the rest is back in the prompt line below; check it and",
+      "  press Enter to send it.",
+    }, "WarningMsg")
+    set_prompt_text(cleaned)
     return
   end
 

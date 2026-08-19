@@ -761,4 +761,101 @@ T.eq(vim.api.nvim_buf_line_count(dialog.bufnr()), before_blank,
   "an empty Enter changes nothing in the transcript")
 wt.close()
 
+-- ---------------------------------------------------------------------------
+-- Review, Important — the control-character refusal must leave the reader's
+-- text RECOVERABLE, matching the no-reader refusal's model (M.on_refused,
+-- tested above), rather than a bare prompt line and a generic warning.
+--
+-- Real control bytes (SOH, ESC) cannot be produced by feeding ordinary
+-- termcodes through nvim_feedkeys in insert mode: a raw \1 there is Ctrl-A,
+-- an insert-mode COMMAND ("insert previously inserted text"), not a literal
+-- character -- feeding it would test nvim's own keymap, not this code. A
+-- paste bypasses that: the bytes land in the buffer as text, not as key
+-- commands. So this sets the (still-editable) prompt line's content directly
+-- -- exactly what a paste leaves behind -- and drives the ACTUAL Enter
+-- keypress through nvim_feedkeys, which is what reaches M.submit(text, true)
+-- for real. A test that called dialog.submit() with a Lua string containing
+-- "\1" would prove nothing about this path: D3's history-deletion runs only
+-- when from_keystroke is true, and that is exactly the interaction under
+-- test here (the regression D3 introduced).
+-- ---------------------------------------------------------------------------
+local function paste_and_enter(raw_line)
+  local buf = dialog.bufnr()
+  local win = dialog.winid()
+  local last = vim.api.nvim_buf_line_count(buf)
+  vim.api.nvim_buf_set_lines(buf, last - 1, last, false, { raw_line })
+  vim.api.nvim_win_set_cursor(win, { last, #raw_line })
+  vim.api.nvim_set_current_win(win)
+  vim.cmd("startinsert!")
+  vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<CR>", true, false, true), "x", false)
+  vim.wait(200)
+end
+
+wt.open("tests/fixtures/two_files.tour")
+wt.ask()
+-- \1 (SOH) and \27 (ESC) are in the rejected class. No \n/\r here on purpose:
+-- a single nvim buffer LINE cannot hold a raw \n at all (that byte is the
+-- line separator itself -- nvim_buf_set_lines refuses one embedded in an
+-- element, which is exactly why the fix cannot just restore raw text
+-- verbatim), so a real paste landing in one prompt line structurally cannot
+-- carry one either. That combination is tested separately below, the one way
+-- it actually is reachable: the public M.submit API, called programmatically.
+paste_and_enter("> bad\1question\27here")
+
+local cc_lines = vim.api.nvim_buf_get_lines(dialog.bufnr(), 0, -1, false)
+T.ok(vim.iter(cc_lines):any(function(l)
+  return l:find("cannot contain control characters", 1, true) ~= nil
+end), "the rejection is still announced")
+T.eq(cc_lines[#cc_lines], "> badquestionhere",
+  "...and the CLEANED text -- control bytes gone -- is back in the editable "
+  .. "prompt line, not lost")
+T.ok(not vim.iter(cc_lines):any(function(l) return l:find("\1", 1, true) ~= nil end),
+  "...no raw control byte survives anywhere in the buffer")
+
+-- One Enter away, as the message promises: pressing it again actually sends
+-- the cleaned question, exactly once, with no leftover echo of the rejection.
+local real_send5 = channel.send
+local cc_payload
+channel.send = function(_p, payload) cc_payload = payload return true end
+vim.cmd("startinsert!")
+vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<CR>", true, false, true), "x", false)
+vim.wait(200)
+channel.send = real_send5
+
+T.ok(cc_payload ~= nil, "the cleaned question sends successfully on the next Enter")
+T.eq(cc_payload and vim.json.decode(cc_payload).question, "badquestionhere",
+  "...carrying exactly the cleaned text")
+T.eq(count_lines_containing(dialog.bufnr(), "badquestionhere"), 1,
+  "...and lands in the transcript exactly once")
+wt.close()
+
+-- Consistency, in both directions: a no-reader refusal (existing coverage,
+-- above) and a control-character refusal now share the same shape -- the
+-- reader's text ends up back in the editable prompt line either way.
+wt.open("tests/fixtures/two_files.tour")
+wt.ask()
+paste_and_enter("> another\1bad\27one")
+local cc2_lines = vim.api.nvim_buf_get_lines(dialog.bufnr(), 0, -1, false)
+T.eq(cc2_lines[#cc2_lines], "> anotherbadone",
+  "a second control-character refusal restores its own cleaned text the same way")
+dialog.cancel_pending(true)
+wt.close()
+
+-- The \n/\r-flattening branch: only reachable programmatically (a real
+-- keystroke's `text` can never contain \n -- see above), but M.submit is a
+-- public interface (Task 7's own doc comment says so) and must not raise
+-- when a caller combines a rejected control byte with a legitimate embedded
+-- newline. Asserted on the restored prompt line rather than on the message,
+-- since a raise inside M.submit is exactly what nvim_buf_set_lines would do
+-- if the restore tried to keep the newline verbatim.
+wt.open("tests/fixtures/two_files.tour")
+wt.ask()
+local nl_ok = pcall(dialog.submit, "bad\1question\27with\nnewline\rhere")
+T.ok(nl_ok, "a control-character question that also carries \\n does not raise")
+local nl_lines = vim.api.nvim_buf_get_lines(dialog.bufnr(), 0, -1, false)
+T.eq(nl_lines[#nl_lines], "> badquestionwith newline here",
+  "...and the embedded newline and CR are each flattened to a space so the "
+  .. "single-line prompt can hold the cleaned text")
+wt.close()
+
 T.done()
