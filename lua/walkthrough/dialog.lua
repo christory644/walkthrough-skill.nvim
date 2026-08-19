@@ -136,6 +136,25 @@ function M.open(ctx)
   vim.cmd("startinsert")
 end
 
+-- Refresh the context a live dialog is scoped to, without touching the
+-- transcript. init.lua calls this at every point the walkthrough's position
+-- moves (a step, in either direction, from any of the several places that can
+-- drive one), so a dialog left open across a step keeps the right
+-- step_id/index in its outbound payload (`send_now` reads S.ctx) and in the
+-- winbar, rather than freezing at whatever M.open or M.on_reload last saw.
+--
+-- Distinct from M.on_reload: a reload means the TOUR changed under the
+-- reader's feet and that belongs in the transcript; an ordinary step is not
+-- news and must not narrate itself there on every keypress.
+--
+-- A no-op with nothing to update: no ctx (nothing to refresh with) or no
+-- buffer (nothing is scoped yet -- the next M.open call builds ctx fresh).
+function M.update_ctx(ctx)
+  if not (ctx and M.has_buffer()) then return end
+  S.ctx = ctx
+  M.refresh()
+end
+
 -- A reload re-renders everything the reader is looking at, and the step the
 -- transcript is scoped to may have moved or gone. Say so in the transcript
 -- rather than silently re-scoping: a question two lines above the notice was

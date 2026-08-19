@@ -261,6 +261,11 @@ function M.open(path_or_tour)
   -- same window here, but asking nav is what keeps them the same after any
   -- future change to where a step is drawn.
   attach_keys(landed or vim.api.nvim_get_current_buf())
+  -- A dialog can already be alive here (M.reload's `dialog_was_open` path
+  -- calls M.open with the tour already parsed while the OLD dialog buffer
+  -- survives). Its ctx is stale the moment index moved above; a no-op
+  -- everywhere else, since a fresh M.open has no dialog to refresh yet.
+  dialog.update_ctx(dialog_ctx())
 
   if #skipped > 0 then
     vim.api.nvim_echo({ { string.format(
@@ -288,6 +293,14 @@ function M.goto_step(n)
   -- it in state.touched -- which is exactly where the dialog must never be, or
   -- the next reload runs `silent! edit!` over the transcript.
   if landed then attach_keys(landed) end
+  -- Every caller of M.goto_step -- M.step (bound to ]w/[w and to the CLI's
+  -- `walkthrough step +N`), the CLI's direct `walkthrough step N`, and
+  -- M.reload's own goto_id -- moves state.index right above. A dialog left
+  -- open across that move must not go on describing the step the reader was
+  -- on when it was opened (or last reloaded): D2. This is the ONLY place
+  -- state.index changes outside M.open (nav.goto_index writes it, but only
+  -- from here or from M.open), so it is the one place this needs saying.
+  dialog.update_ctx(dialog_ctx())
 end
 
 function M.step(delta) M.goto_step(state.index + delta) end

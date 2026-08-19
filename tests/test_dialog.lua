@@ -630,4 +630,57 @@ T.ok(f3_late:find(string.format('late — this answers step %s, "%s"', sent[1].i
 dialog.ANSWER_TIMEOUT_MS = 300000
 wt.close()
 
+-- ---------------------------------------------------------------------------
+-- D2 (implementation-plan report) — a dialog left open across a step
+-- describes the step the reader IS on, not the one they opened it on.
+--
+-- dialog_ctx() used to be computed only at M.ask()/M.reload() time and never
+-- again: state.index kept moving (M.goto_step, the ordinary path for `]w`,
+-- `<leader>an/ap`, and the CLI's `walkthrough step`) while S.ctx froze at
+-- whatever it was when the dialog was last opened or reloaded. A question
+-- typed into an already-open dialog was then tagged with the WRONG step, and
+-- the winbar told the same lie.
+--
+-- Identical-if-broken: `wt.state().index` moving is not what was ever in
+-- doubt. Assert the OUTBOUND PAYLOAD (what the agent actually receives, via
+-- the same channel.send stub P4/reload's `sent_tour` block above uses) and the
+-- winbar (what the reader actually sees) -- the two places the stale value
+-- above was read from.
+-- ---------------------------------------------------------------------------
+local function sent_payload(question)
+  local real_send = channel.send
+  local payload
+  channel.send = function(_path, p) payload = p return true end
+  dialog.submit(question)
+  channel.send = real_send
+  return payload and vim.json.decode(payload) or nil
+end
+
+wt.open("tests/fixtures/two_files.tour")
+wt.ask()    -- dialog opens scoped to step 1, "first" -- and is never reopened below
+wt.step(1)  -- step 2
+wt.step(1)  -- step 3, "back again"
+local d2 = sent_payload("where am I now?")
+T.eq(wt.state().index, 3, "the walkthrough really is on step 3")
+T.eq(d2.index, 3, "the question is tagged with the CURRENT step, not the one the dialog opened on")
+T.eq(d2.step_id, wt.state().id, "...and the step_id agrees")
+local d2_winbar = tostring(vim.wo[dialog.winid()].winbar)
+T.ok(d2_winbar:find(wt.state().id, 1, true) ~= nil,
+  "the winbar also tracks the current step, not a stale one")
+T.ok(d2_winbar:find("3/3", 1, true) ~= nil, "...by position too")
+wt.close()
+
+-- ...and the same holds for the path SKILL.md § 8 actually tells the
+-- answering agent to take: `walkthrough step +1` right after answering, with
+-- the reader sitting in the dialog the whole time -- the ordinary case, not an
+-- edge one.
+wt.open("tests/fixtures/two_files.tour")
+wt.ask()
+dialog.issued["d2b"] = { step = wt.state().id, index = wt.state().index, answered = false }
+wt._answer("d2b", "you're on step 1")
+wt.step(1)  -- the agent's own `walkthrough step +1`
+local d2b = sent_payload("and now?")
+T.eq(d2b.index, 2, "after the agent's own step +1, a new question is tagged step 2")
+wt.close()
+
 T.done()
