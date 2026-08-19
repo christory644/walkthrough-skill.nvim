@@ -2,6 +2,7 @@ local tour_mod = require("walkthrough.tour")
 local render   = require("walkthrough.render")
 local nav      = require("walkthrough.nav")
 local keys_mod = require("walkthrough.keys")
+local dialog   = require("walkthrough.dialog")
 
 local M = {}
 
@@ -31,6 +32,26 @@ end
 
 local function remember(b) state.touched[b] = true end
 
+-- The question has to carry the tour's ABSOLUTE path: durable tours are
+-- co-located with what they describe and throwaway ones live in a temp
+-- directory, so there is no canonical location for the agent to infer.
+--
+-- It is kept beside the tour rather than on it: `tour.validate` owns the fields
+-- it computes, and a .tour file is untrusted input — a document that named its
+-- own `path` must not be believed.
+local function dialog_ctx()
+  return {
+    -- The live keys table, so the dialog's own buffer-local binding
+    -- (keys.dialog_close) is whatever setup{} last said it was.
+    keys = config.keys,
+    fifo = vim.env.WALKTHROUGH_DIALOG,
+    tour = state.path or "",
+    step_id = state.tour and tour_mod.step_id(state.tour, state.index) or "",
+    index = state.index,
+    count = state.tour and #state.tour.steps or 0,
+  }
+end
+
 -- Attach the current config.keys to buf and record exactly that table, so a
 -- later detach (whenever it happens) removes what was really bound here,
 -- independent of anything setup() does to config.keys in between.
@@ -45,7 +66,56 @@ local function detach_keys(buf)
   state.attached[buf] = nil
 end
 
+-- The files this nvim is responsible for, and the two moments it must remove
+-- them (#30).
+--
+-- `walkthrough close` — the CLI path — already cleaned these up, but it is the
+-- RARE path. The design intends the reader to quit from inside nvim, and that
+-- path runs M.close(), which fires `_close_surface` and dies with its surface
+-- without ever re-entering the CLI. So the leaking path was the common one, and
+-- once the dialog lands the leak includes a FIFO with no reader — precisely the
+-- object the dialog design is built to avoid.
+--
+-- Unlinking here rather than through a CLI verb is deliberate: VimLeavePre has
+-- to work for `:qa!` and for a killed surface, and a jobstart fired there is not
+-- guaranteed to outlive us. fs_unlink is synchronous and needs no process.
+--
+-- Only paths the CLI injected are touched. With no env, this does nothing at
+-- all — it is not a delete-anything primitive.
+local function session_cleanup()
+  local uv = vim.uv or vim.loop
+  for _, var in ipairs({ "WALKTHROUGH_STATE", "WALKTHROUGH_SOCKET", "WALKTHROUGH_DIALOG" }) do
+    local p = vim.env[var]
+    if p and p ~= "" then pcall(uv.fs_unlink, p) end
+  end
+end
+
+-- The removal hook belongs to the PROCESS, not to the tour. It used to live in
+-- state.augroup, which `teardown` deletes -- so any path that tore a walkthrough
+-- down without following it with session_cleanup() left nvim alive with nothing
+-- to unlink the FIFO on exit. M.reload's double-failure branch is exactly that
+-- path: it tears down, and by then state.active is false, so a later M.close()
+-- returns early without cleaning up either. The reader `:qa!`s and the FIFO, the
+-- socket and the state file all survive -- the leak #30 exists to prevent.
+--
+-- Unlinking on the spot would be the wrong repair: this nvim is still alive and
+-- still listening on that socket, and the state file is how the CLI finds it, so
+-- the files are still in use. They stop being in use when the process does.
+-- Installed once, in its own group, and never cleared.
+local cleanup_group
+local function install_session_cleanup()
+  if cleanup_group then return end
+  cleanup_group = vim.api.nvim_create_augroup("WalkthroughSession", { clear = true })
+  -- The exit that never reaches M.close: `:qa!`, or the surface being killed
+  -- out from under us. Unlinking is synchronous, so it completes before we go.
+  vim.api.nvim_create_autocmd("VimLeavePre", {
+    group = cleanup_group,
+    callback = session_cleanup,
+  })
+end
+
 local function install_autocmd()
+  install_session_cleanup()
   state.augroup = vim.api.nvim_create_augroup("Walkthrough", { clear = true })
   vim.api.nvim_create_autocmd("BufEnter", {
     group = state.augroup,
@@ -79,6 +149,14 @@ end
 -- running in. Shared by close() and by the one abort path in open(), which
 -- must not leave a half-open walkthrough behind.
 local function teardown()
+  -- The dialog is closed here rather than by riding on state.touched.
+  -- Registering it there would put it in M.reload's `silent! edit!` loop, which
+  -- is wrong for a prompt buffer and would destroy a transcript the reload was
+  -- very likely CAUSED by -- an answer that rewrote the tour. So `reload` does
+  -- NOT close it: it keeps the dialog and tells it the tour changed
+  -- (`dialog.on_reload`). This is the only place it is closed, and nothing is
+  -- leaked either way.
+  dialog.close()
   for b in pairs(state.touched) do
     if vim.api.nvim_buf_is_valid(b) then
       render.clear(b)
@@ -89,6 +167,7 @@ local function teardown()
   state.augroup, state.active, state.tour, state.index, state.touched =
     nil, false, nil, 0, {}
   state.attached = {}
+  state.path = nil
   -- Clear the list we built, and only that one. The quickfix list is a single
   -- global slot the reader can claim at any moment -- a `:grep` mid-tour makes
   -- it theirs -- and this call used to empty whatever was in it, so closing a
@@ -132,6 +211,8 @@ function M.open(path_or_tour)
 
   state.tour, state.index, state.touched, state.skipped = t, 1, {}, skipped
   state.attached = {}
+  state.path = type(path_or_tour) == "string"
+    and vim.fn.fnamemodify(path_or_tour, ":p") or nil
 
   -- `state.active` means "this walkthrough is fully installed", so it is set
   -- LAST -- after the quickfix list, the autocmd and the first jump have all
@@ -143,6 +224,7 @@ function M.open(path_or_tour)
   -- first jump (its callback returns early while inactive), which is exactly
   -- what we want: goto_index draws and parks that buffer itself, and the keys
   -- for it are attached below.
+  local landed
   local ok, err = pcall(function()
     -- The drop hook is not optional here either. Building the quickfix list is
     -- the first thing that hands a step's own fields to vim, so it is the first
@@ -157,7 +239,7 @@ function M.open(path_or_tour)
     -- The real state table, not a copy: nav discovers unresolvable steps
     -- lazily, as it loads their buffers, and a step it drops has to reach
     -- state.skipped to be reported below.
-    state.index = nav.goto_index(state, first)
+    state.index, landed = nav.goto_index(state, first)
   end)
   if not ok then
     -- Half a walkthrough is worse than none: the caller gets the failure, the
@@ -175,8 +257,15 @@ function M.open(path_or_tour)
   end
 
   state.active = true
-  local buf = vim.api.nvim_get_current_buf()
-  attach_keys(buf)
+  -- The buffer nav actually drew into, not whatever is current: they are the
+  -- same window here, but asking nav is what keeps them the same after any
+  -- future change to where a step is drawn.
+  attach_keys(landed or vim.api.nvim_get_current_buf())
+  -- A dialog can already be alive here (M.reload's `dialog_was_open` path
+  -- calls M.open with the tour already parsed while the OLD dialog buffer
+  -- survives). Its ctx is stale the moment index moved above; a no-op
+  -- everywhere else, since a fresh M.open has no dialog to refresh yet.
+  dialog.update_ctx(dialog_ctx())
 
   if #skipped > 0 then
     vim.api.nvim_echo({ { string.format(
@@ -196,12 +285,32 @@ function M.goto_step(n)
   if not state.active then error("no walkthrough is open: nothing to step", 0) end
   -- The real state table, so a step nav finds unresolvable is recorded in
   -- state.skipped and surfaces in state() rather than vanishing.
-  state.index = nav.goto_index(state, n)
-  local buf = vim.api.nvim_get_current_buf()
-  attach_keys(buf)
+  local landed
+  state.index, landed = nav.goto_index(state, n)
+  -- The buffer the step was drawn into, NOT the current one. A step driven from
+  -- the CLI while the reader is in the dialog leaves their focus in the dialog,
+  -- and attaching the walkthrough's keymaps to the prompt buffer would also put
+  -- it in state.touched -- which is exactly where the dialog must never be, or
+  -- the next reload runs `silent! edit!` over the transcript.
+  if landed then attach_keys(landed) end
+  -- Every caller of M.goto_step -- M.step (bound to ]w/[w and to the CLI's
+  -- `walkthrough step +N`), the CLI's direct `walkthrough step N`, and
+  -- M.reload's own goto_id -- moves state.index right above. A dialog left
+  -- open across that move must not go on describing the step the reader was
+  -- on when it was opened (or last reloaded): D2. This is the ONLY place
+  -- state.index changes outside M.open (nav.goto_index writes it, but only
+  -- from here or from M.open), so it is the one place this needs saying.
+  dialog.update_ctx(dialog_ctx())
 end
 
 function M.step(delta) M.goto_step(state.index + delta) end
+
+function M.ask()
+  -- Raise rather than return quietly, for the same reason goto_step does: a
+  -- --remote-expr call that returns quietly reaches the shell as exit 0.
+  if not state.active then error("no walkthrough is open: nothing to ask about", 0) end
+  dialog.open(dialog_ctx())
+end
 
 -- Restore the reader's position by step id, which is what survives a tour being
 -- rewritten under them: indices move, titles do not.
@@ -236,7 +345,17 @@ function M.reload(path_or_tour)
     error("reload failed: " .. tostring(t) .. " (the walkthrough is unchanged)", 0)
   end
 
+  -- The new tour's absolute path, computed the same way M.open computes it --
+  -- but computed HERE, from path_or_tour, because M.open below is called with
+  -- `t` (the already-parsed/validated TABLE), not with path_or_tour itself, so
+  -- M.open's own `type(...) == "string"` gate can never see a string during a
+  -- reload and would otherwise leave state.path nil on every reload, even one
+  -- the CLI always drives with a real path.
+  local new_path = type(path_or_tour) == "string"
+    and vim.fn.fnamemodify(path_or_tour, ":p") or nil
+
   local previous_tour = state.tour
+  local previous_path = state.path
   local previous = tour_mod.step_id(state.tour, state.index)
   -- Flip inactive before touching any buffer below: `:edit!` on a buffer that
   -- is still current can re-trigger our own BufEnter autocmd, and while
@@ -247,6 +366,11 @@ function M.reload(path_or_tour)
   -- state.touched: that reset discards the only record that these buffers
   -- were ever part of a walkthrough, so any that drop out of the new tour
   -- would otherwise keep their keymaps for the life of the process.
+  -- Keep the dialog. See teardown. The BUFFER is the conversation, so a dialog
+  -- the reader has dismissed still gets told the tour changed -- reopening it
+  -- after a reload must not show questions asked about the old tour with nothing
+  -- to say they were.
+  local dialog_was_open = dialog.has_buffer()
   for b in pairs(state.touched) do
     if vim.api.nvim_buf_is_valid(b) then
       render.clear(b)
@@ -262,6 +386,10 @@ function M.reload(path_or_tour)
     -- were standing. Put the previous tour back, on the step they were on.
     teardown()
     if pcall(M.open, previous_tour) then
+      -- M.open just set state.path from previous_tour, a TABLE, so its own
+      -- gate left it nil -- restore the path the reader was actually looking
+      -- at before this reload was attempted.
+      state.path = previous_path
       goto_id(previous)
       error("reload failed: " .. tostring(oerr) ..
         " (the previous walkthrough was kept)", 0)
@@ -270,13 +398,38 @@ function M.reload(path_or_tour)
     error("reload failed: " .. tostring(oerr) ..
       " (and the previous walkthrough could not be restored, so it is closed)", 0)
   end
+  -- Likewise: M.open just set state.path from `t`, a TABLE, so its own gate
+  -- left it nil -- state.path is the one fact about this reload that M.open
+  -- cannot determine for itself.
+  state.path = new_path
   goto_id(previous)
+  if dialog_was_open then dialog.on_reload(dialog_ctx()) end
   return M.state()
+end
+
+-- The inbound leg, and it is the dangerous one: agent-authored text arriving on
+-- a channel that can execute arbitrary Lua.
+--
+-- Three rules, matching the three at the top of bin/walkthrough:
+--   1. The text crossed as base64 and was decoded by vim.base64.decode on this
+--      side. It is never interpolated into the expression.
+--   2. The transport carries DATA plus a fixed verb — this function — never an
+--      expression. There is no way to evaluate Lua in the player as part of
+--      answering.
+--   3. It reaches the buffer through nvim_buf_set_lines, never through :put,
+--      execute, or anything that reads it as a command.
+--
+-- Underscore-prefixed because it is the CLI's entry point, not a public API.
+function M._answer(nonce, text)
+  local ok, reason = dialog.answer(nonce, text)
+  if not ok then error(reason, 0) end
+  return true
 end
 
 function M.close()
   if not state.active then return end
   teardown()
+  session_cleanup()
 
   -- Close our own surface if a backend gave us one. The backend positioned it
   -- so that closing returns the user where they came from.

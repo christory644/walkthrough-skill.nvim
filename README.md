@@ -140,12 +140,14 @@ session — is written to a temp directory and never touches your working tree.
 
 Once a walkthrough is open, in nvim:
 
-| key | action |
-|---|---|
-| `]w` / `[w` | next / previous step |
-| `<leader>an` / `<leader>ap` | next / previous step |
-| `<leader>aq` | end the walkthrough |
-| `:copen` | the whole tour as a list |
+| key | action | where |
+|---|---|---|
+| `]w` / `[w` | next / previous step | code windows only — the panel is where you compose a question, and `]`/`[` are motion prefixes there |
+| `<leader>an` / `<leader>ap` | next / previous step | code windows only, same reason |
+| `<leader>aa` | ask about this step | code windows, and the panel itself — asking again while already inside it refocuses the prompt and refreshes it to whatever step you're now on |
+| `q` | dismiss the question panel (`<leader>aa` brings it back, with the conversation still in it) | the panel only |
+| `<leader>aq` | end the walkthrough | everywhere the walkthrough owns — code windows and the panel alike, so you never have to hunt for the right window first |
+| `:copen` | the whole tour as a list | — |
 
 The player is a real nvim running your own config, not a viewer that imitates
 one: syntax, treesitter, LSP and git signs all work on the code a tour walks you
@@ -156,7 +158,7 @@ an active walkthrough, and all of them are configurable:
 
 ```lua
 require("walkthrough").setup({
-  keys = { next = "]w", prev = "[w", close = "<leader>aq" },
+  keys = { next = "]w", prev = "[w", close = "<leader>aq", dialog_close = "q" },
 })
 ```
 

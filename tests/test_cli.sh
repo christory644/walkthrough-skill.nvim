@@ -13,7 +13,14 @@ check() { if [ "$2" = "$3" ]; then echo "  ok: $1"; else echo "  FAIL: $1 (want 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/walkthrough-test.XXXXXX")" || exit 1
 # Point the CLI's state directory at $WORK too, so the suite can never disturb
 # (or be disturbed by) a walkthrough the developer actually has open.
-export XDG_RUNTIME_DIR="$WORK/xdg"
+#
+# Short on purpose. $TMPDIR on macOS is ~49 characters before anything is added
+# to it, and the socket now lives under $XDG_RUNTIME_DIR/walkthrough-$USER/ --
+# which put the suite's own socket path at 117 characters, past the 104 that
+# nvim will bind where asked. The suite is not the place to discover that; there
+# is a test for it below.
+XDG_RUNTIME_DIR="$(mktemp -d /tmp/wtx.XXXXXX)"
+export XDG_RUNTIME_DIR
 mkdir -p "$XDG_RUNTIME_DIR"
 STATE_FILE="$XDG_RUNTIME_DIR/walkthrough-${USER:-x}/state"
 
@@ -24,7 +31,7 @@ STATE_FILE="$XDG_RUNTIME_DIR/walkthrough-${USER:-x}/state"
 SOCK="$WORK/player.sock"
 nvim --headless --listen "$SOCK" >/dev/null 2>&1 &
 NVIM_PID=$!
-trap 'kill "$NVIM_PID" 2>/dev/null; wait "$NVIM_PID" 2>/dev/null; rm -rf "$WORK"' EXIT
+trap 'kill "$NVIM_PID" 2>/dev/null; wait "$NVIM_PID" 2>/dev/null; rm -rf "$WORK" "$XDG_RUNTIME_DIR"' EXIT
 i=0
 while [ "$i" -lt 300 ]; do
   nvim --server "$SOCK" --remote-expr '1' >/dev/null 2>&1 && break
@@ -33,12 +40,12 @@ done
 
 # Write a state file using the CLI's own writer, so these tests exercise the
 # real format rather than a hand-rolled imitation of it.
-plant_state() { # backend handle socket tour
+plant_state() { # backend handle socket tour [dialog]
   ( cd "$REPO" && bash -c '
       set -uo pipefail
       source ./bin/walkthrough --help >/dev/null 2>&1
-      state_write "$1" "$2" "$3" "$4"
-    ' _ "$1" "$2" "$3" "$4" )
+      state_write "$1" "$2" "$3" "$4" "${5:-}"
+    ' _ "$1" "$2" "$3" "$4" "${5:-}" )
 }
 
 # ---------------------------------------------------------------------------
@@ -234,6 +241,65 @@ check "C-3b a state directory we own still reads back" "cmux/H" "$c3bok"
 rm -f "$STATE_FILE"
 
 # ---------------------------------------------------------------------------
+# #31 — the socket lives in the private state directory, not shared temp.
+#
+# The socket can drive the editor: anything that reaches it can move the
+# cursor, read buffers and execute Lua. It used to sit at a guessable name in
+# a world-readable directory while the state file — which can do strictly less
+# — sat behind a 0700, symlink-refused, ownership-checked directory. The weaker
+# link defined the security of the pair.
+# ---------------------------------------------------------------------------
+sock_line="$(grep -v '^ *#' "$REPO/bin/walkthrough" | grep -n 'sock=' | head -1)"
+# shellcheck disable=SC2016  # matching a literal '$STATE_DIR' substring in the source, not expanding it
+case "$sock_line" in
+  *'$STATE_DIR'*) check "socket path is built from STATE_DIR" "0" "0" ;;
+  *) check "socket path is built from STATE_DIR" "0" "1 ($sock_line)" ;;
+esac
+case "$sock_line" in
+  *TMPDIR*) check "socket path does not use shared TMPDIR" "0" "1 ($sock_line)" ;;
+  *) check "socket path does not use shared TMPDIR" "0" "0" ;;
+esac
+
+# state_dir_ready must run BEFORE the launch command is built, because the
+# launch command names the socket and nvim will create it there.
+#
+# Comments are stripped before searching: the fix's own commentary explains
+# "state_dir_ready runs HERE..." right above the call, and an unfiltered grep
+# matches that prose line first (it sorts earlier than the real call) — which
+# would keep passing even if the call itself were deleted and only the
+# comment survived. Filtering '^ *#' lines, the same way sock_line above
+# already does, makes the assertion about the call, not the commentary.
+open_body="$(sed -n '/^cmd_open()/,/^}/p' "$REPO/bin/walkthrough" | grep -v '^ *#')"
+ready_at="$(printf '%s\n' "$open_body" | grep -n 'state_dir_ready' | head -1 | cut -d: -f1)"
+sock_at="$(printf '%s\n' "$open_body" | grep -n 'sock=' | head -1 | cut -d: -f1)"
+if [ -n "$ready_at" ] && [ -n "$sock_at" ] && [ "$ready_at" -lt "$sock_at" ]; then
+  check "cmd_open readies the state dir before naming the socket" "0" "0"
+else
+  check "cmd_open readies the state dir before naming the socket" "0" \
+    "1 (ready at ${ready_at:-none}, sock at ${sock_at:-none})"
+fi
+
+# An over-long socket path is refused, loudly, BEFORE nvim is started.
+#
+# Identical-if-broken: asserting only "open failed" passes on the old behaviour,
+# which also failed -- after burning 300 socket-wait tries, misdiagnosing it as
+# "nvim did not answer", and leaving the nvim it started running forever. So the
+# assertion is on the MESSAGE naming the path length, and on the wall clock.
+deep="$(mktemp -d /tmp/wtdeep.XXXXXX)/$(printf 'd%.0s' $(seq 1 80))"
+mkdir -p "$deep"
+t0=$(date +%s)
+out="$(XDG_RUNTIME_DIR="$deep" "$WT" open tests/fixtures/two_files.tour 2>&1)"
+rc=$?; t1=$(date +%s)
+check "an over-long socket path is refused" "1" "$rc"
+case "$out" in
+  *"socket path is too long"*) check "...and the message says why" "0" "0" ;;
+  *) check "...and the message says why" "0" "1 ($out)" ;;
+esac
+elapsed_ok=0; [ $((t1 - t0)) -le 3 ] || elapsed_ok=1
+check "...without waiting on a socket that will never appear" "0" "$elapsed_ok"
+rm -rf "$deep"
+
+# ---------------------------------------------------------------------------
 # C-4 — nothing but base64 crosses the --remote-expr boundary
 #
 # The five values used to be pasted into a vimscript single-quoted list inside
@@ -245,16 +311,20 @@ c4expr="$( cd "$REPO" && bash -c '
     set -uo pipefail
     source ./bin/walkthrough --help >/dev/null 2>&1
     BACKEND=cmux
+    STATE="/tmp/c4-state"
+    sock="/tmp/c4-sock"
+    fifo="/tmp/c4-fifo"
     open_expr "$1" "HANDLE"
   ' _ "$c4payload" )"
 printf %s "$c4expr" | grep -q "system(" && c4leak=1 || c4leak=0
 check "C-4 no attacker text reaches the remote expression" "0" "$c4leak"
 # The quote count is the sharp version of the same claim: the expression is
-# luaeval('<chunk>', ['a','b','c','d','e']) — two quotes around the chunk plus
-# ten around the five base64 arguments, twelve in total, and not one of them
-# comes from the tour path. Any injected quote changes this number.
+# luaeval('<chunk>', ['a','b','c','d','e','f','g','h']) — two quotes around
+# the chunk plus sixteen around the eight base64 arguments, eighteen in
+# total, and not one of them comes from the tour path. Any injected quote
+# changes this number.
 c4quotes="$(printf %s "$c4expr" | tr -cd "'" | wc -c | tr -d ' ')"
-check "C-4 the remote expression holds exactly its own 12 quotes" "12" "$c4quotes"
+check "C-4 the remote expression holds exactly its own 18 quotes" "18" "$c4quotes"
 
 # ...and the far side gets the payload back, verbatim, as data.
 c4b64="$(printf %s "$c4payload" | base64 | tr -d '\n')"
@@ -265,6 +335,86 @@ nvim --headless --clean \
 check "C-4 base64 carries the payload across intact" "$c4payload" "$(cat "$WORK/c4decoded.txt" 2>/dev/null)"
 [ -e "$WORK/PWNED_C4" ] && c4exec=1 || c4exec=0
 check "C-4 vimscript system() never ran" "0" "$c4exec"
+
+# ---------------------------------------------------------------------------
+# The dialog channel: created by the CLI, in the one directory it trusts.
+#
+# The plugin cannot create it safely — it does not know whether its directory
+# is trustworthy — so the same actor that creates the socket creates this, at
+# the same moment, with the same failure path.
+# ---------------------------------------------------------------------------
+FIFO_STATE="$WORK/fifo-state"; mkdir -p "$FIFO_STATE"
+( cd "$REPO" && bash -c '
+    set -uo pipefail
+    source ./bin/walkthrough --help >/dev/null 2>&1
+    state_write b h /tmp/s /tmp/t.tour "$1"
+    state_read
+    printf "%s\n" "$ST_dialog"
+  ' _ "$FIFO_STATE/dialog-1.fifo" ) > "$WORK/dialog-roundtrip"
+check "dialog path round-trips through the state file" \
+  "$FIFO_STATE/dialog-1.fifo" "$(cat "$WORK/dialog-roundtrip")"
+
+# An older CLI's state file has no dialog= line. state_read's whitelist skips
+# unknown keys, so a NEWER file read by an OLDER CLI is already fine; this is
+# the other direction, and it must not die.
+printf 'backend=%s\nhandle=%s\nsocket=%s\ntour=%s\n' \
+  "$(printf b | base64)" "$(printf h | base64)" \
+  "$(printf /tmp/s | base64)" "$(printf /tmp/t | base64)" \
+  > "$XDG_RUNTIME_DIR/walkthrough-${USER:-x}/state"
+( cd "$REPO" && bash -c '
+    set -uo pipefail
+    source ./bin/walkthrough --help >/dev/null 2>&1
+    state_read
+    printf "[%s]\n" "$ST_dialog"
+  ' ) > "$WORK/dialog-absent"
+check "a state file with no dialog= reads as empty, not as an error" \
+  "[]" "$(cat "$WORK/dialog-absent")"
+
+# cmd_open must make it a FIFO, mode 0600, inside STATE_DIR. Comments are
+# stripped BEFORE the grep, not after: `grep -n | grep -v '^ *#'` numbers
+# every line first, so "NNN:" never matches the comment filter and prose in a
+# comment would satisfy the check exactly as well as real code. Filtering
+# first makes this an assertion about the call, not the commentary.
+open_body="$(sed -n '/^cmd_open()/,/^}/p' "$REPO/bin/walkthrough" | grep -v '^ *#')"
+printf '%s\n' "$open_body" | grep -q 'mkfifo' \
+  ; check "cmd_open creates the dialog FIFO" "0" "$?"
+# shellcheck disable=SC2016  # matching a literal '$STATE_DIR' substring in the source, not expanding it
+printf '%s\n' "$open_body" | grep -q 'fifo="\$STATE_DIR/dialog-\$\$\.fifo"' \
+  ; check "the FIFO lives in STATE_DIR, named for this CLI's pid" "0" "$?"
+
+# Every exit reachable after mkfifo must remove the FIFO, not just the two
+# the brief happened to enumerate (wt_wait_for_socket, --remote-expr).
+# backend_open's failure arm is a third, and it is exercised for real here:
+# the tmux backend is forced with $TMUX unset, which fails backend_open
+# inside cmd_open AFTER the FIFO already exists. Without a cleanup on that
+# arm the FIFO is left behind permanently — nvim never started, so the
+# plugin's session_cleanup (which only runs inside a live nvim) never gets a
+# chance to remove it either.
+dfifo_before="$(find "$XDG_RUNTIME_DIR/walkthrough-${USER:-x}" -name 'dialog-*.fifo' 2>/dev/null | wc -l | tr -d ' ')"
+( cd "$REPO" && env -u TMUX WALKTHROUGH_BACKEND=tmux "$WT" open tests/fixtures/two_files.tour ) >/dev/null 2>&1
+dfifo_rc=$?
+check "a failed backend_open exits non-zero" "1" "$dfifo_rc"
+dfifo_after="$(find "$XDG_RUNTIME_DIR/walkthrough-${USER:-x}" -name 'dialog-*.fifo' 2>/dev/null | wc -l | tr -d ' ')"
+check "...and a failed backend_open leaves no FIFO behind" "$dfifo_before" "$dfifo_after"
+
+# ...and cmd_close must take it away, as a backstop to the plugin. This runs
+# cmd_close for real, against a real FIFO on disk, and stats the result — a
+# grep for the string 'ST_dialog' in cmd_close's body proves the identifier
+# is MENTIONED, not that anything is removed: a mutation that kept the
+# identifier in an unrelated real line, while dropping it from the `rm -f`,
+# defeated that check outright.
+dialog_fifo="$WORK/close-dialog.fifo"
+mkfifo -m 600 "$dialog_fifo"
+plant_state cmux close-fifo-handle "$WORK/dead.sock" "$WORK/t.tour" "$dialog_fifo"
+( cd "$REPO" && REPO="$REPO" bash -c '
+    set -uo pipefail
+    source "$REPO/bin/walkthrough" --help >/dev/null 2>&1
+    load_backend()  { BACKEND=stub; }
+    backend_close() { return 0; }
+    cmd_close
+  ' _ ) >/dev/null 2>&1
+[ -e "$dialog_fifo" ] && dialog_left=1 || dialog_left=0
+check "cmd_close removes the dialog FIFO" "0" "$dialog_left"
 
 # ---------------------------------------------------------------------------
 # I-3 — the step argument is an integer or it is refused
@@ -1231,6 +1381,128 @@ ws_expect "throwaway tour outside the repository" '*/ws/repo/src/app.txt'
 # 4. no repository anywhere: the invocation directory IS the root
 ws_open "$WORK/ws/loose" "loose.tour"
 ws_expect "no repository, invocation directory is the root" '*/ws/loose/src/app.txt'
+
+# ---------------------------------------------------------------------------
+# #30 — the COMMON exit path cleans up after itself.
+#
+# <leader>aq runs M.close(), which shells out to `_close_surface` — a verb that
+# closes the surface and touches no state. `walkthrough close` cleans up, but
+# that is the RARE path; the design intends the reader to quit from inside
+# nvim. So the leaking path was the common one.
+#
+# This drives the real M.close() in a real headless nvim with the env the CLI
+# injects, rather than testing the CLI's own `close`, which was never broken.
+# ---------------------------------------------------------------------------
+LEAK="$WORK/leak"; mkdir -p "$LEAK"
+touch "$LEAK/state" "$LEAK/sock"
+cat > "$LEAK/drive.lua" <<'LUA'
+vim.opt.runtimepath:append(vim.env.WT_REPO)
+vim.env.WALKTHROUGH_STATE  = vim.env.WT_STATE
+vim.env.WALKTHROUGH_SOCKET = vim.env.WT_SOCKET
+local wt = require("walkthrough")
+-- close_surface off: this test is about the files, not the multiplexer, and
+-- there is no surface here to close.
+wt.setup({ close_surface = false })
+wt.open(vim.env.WT_TOUR)
+wt.close()
+os.exit(0)
+LUA
+( cd "$REPO" && WT_REPO="$REPO" WT_STATE="$LEAK/state" WT_SOCKET="$LEAK/sock" \
+    WT_TOUR="$REPO/tests/fixtures/two_files.tour" \
+    nvim --headless --clean -l "$LEAK/drive.lua" >/dev/null 2>&1 )
+if [ -e "$LEAK/state" ]; then leak_rc=0; else leak_rc=1; fi
+check "M.close removes the state file" "1" "$leak_rc"
+if [ -e "$LEAK/sock" ]; then leak_rc=0; else leak_rc=1; fi
+check "M.close removes the socket" "1" "$leak_rc"
+
+# ...and the same on the path M.close never runs at all: :qa!, a killed surface.
+touch "$LEAK/state2" "$LEAK/sock2"
+cat > "$LEAK/quit.lua" <<'LUA'
+vim.opt.runtimepath:append(vim.env.WT_REPO)
+vim.env.WALKTHROUGH_STATE  = vim.env.WT_STATE
+vim.env.WALKTHROUGH_SOCKET = vim.env.WT_SOCKET
+local wt = require("walkthrough")
+wt.setup({ close_surface = false })
+wt.open(vim.env.WT_TOUR)
+vim.cmd("qa!")
+LUA
+( cd "$REPO" && WT_REPO="$REPO" WT_STATE="$LEAK/state2" WT_SOCKET="$LEAK/sock2" \
+    WT_TOUR="$REPO/tests/fixtures/two_files.tour" \
+    nvim --headless --clean -l "$LEAK/quit.lua" >/dev/null 2>&1 )
+if [ -e "$LEAK/state2" ]; then leak_rc=0; else leak_rc=1; fi
+check "VimLeavePre removes the state file on :qa!" "1" "$leak_rc"
+if [ -e "$LEAK/sock2" ]; then leak_rc=0; else leak_rc=1; fi
+check "VimLeavePre removes the socket on :qa!" "1" "$leak_rc"
+
+# ...and on the path that tears a walkthrough down while leaving nvim ALIVE.
+#
+# Whole-branch review, F4: teardown() deletes state.augroup, which used to hold
+# the VimLeavePre hook. M.reload's double-failure branch (the new tour will not
+# open AND the previous one cannot be restored) runs teardown with no
+# session_cleanup after it, and state.active is false by then, so a later
+# M.close() returns early without cleaning up either. The reader is left in a
+# live nvim whose exit unlinks nothing.
+#
+# Identical-if-broken: asserting that the reload FAILED passes either way -- it
+# failed on the fixed build too. The discriminating assertion is that the files
+# are gone after the process exits, so this drives the branch and then `:qa!`s.
+# The FIFO is included because it is the object the dialog design exists to
+# avoid leaving behind with no reader.
+touch "$LEAK/state3" "$LEAK/sock3"
+mkfifo -m 600 "$LEAK/fifo3"
+mkdir -p "$LEAK/doomed"
+cp "$REPO/tests/fixtures/alpha.txt" "$LEAK/doomed/alpha.txt"
+printf '%s\n' '{ "title": "doomed", "steps": [
+  { "title": "s1", "file": "alpha.txt", "line": 1, "description": "d" } ] }' \
+  > "$LEAK/doomed/t.tour"
+cat > "$LEAK/double.lua" <<'LUA'
+vim.opt.runtimepath:append(vim.env.WT_REPO)
+vim.env.WALKTHROUGH_STATE  = vim.env.WT_STATE
+vim.env.WALKTHROUGH_SOCKET = vim.env.WT_SOCKET
+vim.env.WALKTHROUGH_DIALOG = vim.env.WT_DIALOG
+local wt = require("walkthrough")
+wt.setup({ close_surface = false })
+wt.open(vim.env.WT_TOUR)
+-- Make the walkthrough that is currently playing unrestorable: its only file
+-- goes away, so re-opening the previous tour fails the same way the new one is
+-- about to.
+os.remove(vim.env.WT_DOOMED)
+local ok, err = pcall(wt.reload, { title = "will not play", steps = {
+  { title = "gone", file = "/nonexistent/nowhere.txt", line = 1, description = "d" },
+} })
+local f = io.open(vim.env.WT_OUT, "w")
+f:write(tostring(ok) .. "|" .. tostring(err))
+f:close()
+vim.cmd("qa!")
+LUA
+( cd "$LEAK/doomed" && WT_REPO="$REPO" WT_STATE="$LEAK/state3" WT_SOCKET="$LEAK/sock3" \
+    WT_DIALOG="$LEAK/fifo3" WT_TOUR="$LEAK/doomed/t.tour" \
+    WT_DOOMED="$LEAK/doomed/alpha.txt" WT_OUT="$LEAK/double.out" \
+    nvim --headless --clean -l "$LEAK/double.lua" >/dev/null 2>&1 )
+grep -q 'could not be restored' "$LEAK/double.out"
+check "the double-failure reload branch was really taken" "0" "$?"
+if [ -e "$LEAK/state3" ]; then leak_rc=0; else leak_rc=1; fi
+check "...and :qa! still removes the state file afterwards" "1" "$leak_rc"
+if [ -e "$LEAK/sock3" ]; then leak_rc=0; else leak_rc=1; fi
+check "...and the socket" "1" "$leak_rc"
+if [ -e "$LEAK/fifo3" ]; then leak_rc=0; else leak_rc=1; fi
+check "...and the FIFO" "1" "$leak_rc"
+
+# The guard that keeps this from becoming a delete-anything primitive: with no
+# env injected, nothing is unlinked.
+touch "$LEAK/bystander"
+cat > "$LEAK/noenv.lua" <<'LUA'
+vim.opt.runtimepath:append(vim.env.WT_REPO)
+local wt = require("walkthrough")
+wt.setup({ close_surface = false })
+wt.open(vim.env.WT_TOUR)
+wt.close()
+os.exit(0)
+LUA
+( cd "$REPO" && WT_REPO="$REPO" WT_TOUR="$REPO/tests/fixtures/two_files.tour" \
+    nvim --headless --clean -l "$LEAK/noenv.lua" >/dev/null 2>&1 )
+if [ -e "$LEAK/bystander" ]; then leak_rc=0; else leak_rc=1; fi
+check "with no env injected, nothing is unlinked" "0" "$leak_rc"
 
 # Say which it was, out loud. This printed the PASSED line or nothing at all,
 # so a failing run looked like a run whose tail had scrolled — and a reader

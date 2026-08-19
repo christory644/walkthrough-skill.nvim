@@ -141,22 +141,22 @@ state_dir_ready() {
   chmod 700 "$STATE_DIR" 2>/dev/null || true
 }
 
-state_write() { # backend handle socket tour(absolute)
+state_write() { # backend handle socket tour(absolute) dialog
   state_dir_ready
   rm -f "$STATE"   # never write through a pre-existing symlink
   ( umask 077
-    printf 'backend=%s\nhandle=%s\nsocket=%s\ntour=%s\n' \
-      "$(b64 "$1")" "$(b64 "$2")" "$(b64 "$3")" "$(b64 "$4")" > "$STATE"
+    printf 'backend=%s\nhandle=%s\nsocket=%s\ntour=%s\ndialog=%s\n' \
+      "$(b64 "$1")" "$(b64 "$2")" "$(b64 "$3")" "$(b64 "$4")" "$(b64 "${5:-}")" > "$STATE"
   ) || die "cannot write state: $STATE"
 }
 
-ST_backend=""; ST_handle=""; ST_socket=""; ST_tour=""
+ST_backend=""; ST_handle=""; ST_socket=""; ST_tour=""; ST_dialog=""
 
 # Parse. Never source. Each line is key=<base64>; anything else is corruption,
 # not a command.
 state_read() {
   local line key val
-  ST_backend=""; ST_handle=""; ST_socket=""; ST_tour=""
+  ST_backend=""; ST_handle=""; ST_socket=""; ST_tour=""; ST_dialog=""
   # The DIRECTORY, before the file (#15). Writing checked it and reading did
   # not, and the two questions are not the same one asked twice: a directory
   # someone else owns — or a symlink pointing at one — cannot produce a state
@@ -176,7 +176,12 @@ state_read() {
   if [ ! -O "$STATE" ]; then die "state file is not owned by you, refusing: $STATE"; fi
   while IFS= read -r line || [ -n "$line" ]; do
     key="${line%%=*}"; val="${line#*=}"
-    case "$key" in backend|handle|socket|tour) ;; *) continue ;; esac
+    # `dialog` is the newest key. The whitelist skips anything it does not
+    # know, so an older CLI reading a newer state file ignores it rather than
+    # choking — and a FIFO whose name is not in the current state file is by
+    # construction not this session's, which is what makes a dead session's
+    # FIFO unadoptable (P6). Nothing derives the name; it is recorded.
+    case "$key" in backend|handle|socket|tour|dialog) ;; *) continue ;; esac
     case "$val" in *[!A-Za-z0-9+/=]*) die "state file is corrupt (bad value for $key)" ;; esac
     val="$(unb64 "$val")"
     case "$key" in
@@ -184,6 +189,7 @@ state_read() {
       handle)  ST_handle="$val"  ;;
       socket)  ST_socket="$val"  ;;
       tour)    ST_tour="$val"    ;;
+      dialog)  ST_dialog="$val"  ;;
     esac
   done < "$STATE"
 }
@@ -271,17 +277,23 @@ cmd_list() {
   ls -1 -- "$dir"/*.tour 2>/dev/null || { echo "no tours in $dir/" >&2; exit 1; }
 }
 
-# The five values the player needs, handed over as base64 inside a vimscript
-# list and decoded in Lua. Keep this chunk free of single quotes: it lives
-# inside a vimscript single-quoted string.
+# The plugin is handed the paths it is responsible for cleaning up (#30), not
+# just the ones it needs to render. The common exit is <leader>aq, which runs
+# M.close() and then dies with its surface — it never re-enters this CLI's
+# `cmd_close`, so anything relying on `walkthrough close` leaks on the ordinary
+# case. Every value is base64: the state path can contain anything $TMPDIR does.
+#
+# $sock is a local of cmd_open, which is open_expr's only caller — bash locals
+# are dynamically scoped, so it is visible here without being passed in.
 open_expr() { # $1 = absolute tour path, $2 = handle
-  printf "luaeval('%s', ['%s','%s','%s','%s','%s'])" \
-    '(function(a) local d = vim.base64.decode vim.opt.runtimepath:append(d(a[1])) vim.env.WALKTHROUGH_HANDLE = d(a[3]) vim.env.WALKTHROUGH_BACKEND = d(a[4]) vim.env.WALKTHROUGH_CLI = d(a[5]) require("walkthrough").open(d(a[2])) return 1 end)(_A)' \
-    "$(b64 "$ROOT")" "$(b64 "$1")" "$(b64 "$2")" "$(b64 "$BACKEND")" "$(b64 "$ROOT/bin/walkthrough")"
+  printf "luaeval('%s', ['%s','%s','%s','%s','%s','%s','%s','%s'])" \
+    '(function(a) local d = vim.base64.decode vim.opt.runtimepath:append(d(a[1])) vim.env.WALKTHROUGH_HANDLE = d(a[3]) vim.env.WALKTHROUGH_BACKEND = d(a[4]) vim.env.WALKTHROUGH_CLI = d(a[5]) vim.env.WALKTHROUGH_STATE = d(a[6]) vim.env.WALKTHROUGH_SOCKET = d(a[7]) vim.env.WALKTHROUGH_DIALOG = d(a[8]) require("walkthrough").open(d(a[2])) return 1 end)(_A)' \
+    "$(b64 "$ROOT")" "$(b64 "$1")" "$(b64 "$2")" "$(b64 "$BACKEND")" \
+    "$(b64 "$ROOT/bin/walkthrough")" "$(b64 "$STATE")" "$(b64 "$sock")" "$(b64 "$fifo")"
 }
 
 cmd_open() {
-  local tour tourabs wsroot sock handle f skips line
+  local tour tourabs wsroot sock fifo handle f skips line
   local -a files_arr=()
   tour="${1:-}"; [ -f "$tour" ] || die "no such tour: $tour"
   # Absolutise BEFORE anything runs from another directory, and settle the
@@ -307,6 +319,45 @@ cmd_open() {
     echo "walkthrough: dropping unplayable step(s); the rest of the tour plays:" >&2
     while IFS= read -r line; do echo "  $line" >&2; done <<< "$skips"
   fi
+  # The socket, not the state file, is the sensitive one: anything that can
+  # reach it can drive the editor — move the cursor, read buffers, run Lua. It
+  # used to live at ${TMPDIR:-/tmp}/walkthrough-$$.sock, a guessable name in a
+  # world-readable directory, mitigated only by $$ being hard to guess, which
+  # is not a security property (#31). It now sits beside the state file in the
+  # one directory this project is willing to trust: 0700, symlink-refused,
+  # ownership-checked.
+  #
+  # state_dir_ready runs HERE, before the launch command is built, because the
+  # launch command names the socket and nvim creates it on startup — the
+  # directory has to exist and have passed its checks first.
+  #
+  # This whole block runs BEFORE load_backend, and deliberately: neither
+  # state_dir_ready nor the length check below needs a backend, a socket path
+  # that cannot be bound is a fatal configuration error worth failing on
+  # before any other work is done, and checking it after load_backend made the
+  # refusal depend on an unrelated fact — whether a terminal multiplexer
+  # happened to be present — instead of on the path itself. On a bare runner
+  # with no multiplexer, load_backend-first meant this length check was never
+  # reached at all: `cmd_open` died on "no backend" first, and the message a
+  # too-long path is supposed to produce was never seen. Caught by CI, not by
+  # any local run, because every local run of this suite so far happened to
+  # have cmux or tmux present.
+  #
+  # Length IS a constraint, and getting it wrong is silent. Measured: past 104
+  # characters nvim truncates the path to fit sun_path and binds the socket
+  # somewhere else -- dropping the last component -- while still reporting the
+  # path you asked for as v:servername. RPC connects either way, so the failure
+  # looks like success from every angle except the one that matters: the socket
+  # is not in the directory whose ownership we checked, and `rm -f` on the
+  # recorded path deletes nothing. Refusing is the only honest answer.
+  state_dir_ready
+  sock="$STATE_DIR/sock-$$"; rm -f "$sock"
+  # 104 is macOS's limit; Linux allows 108. The smaller one is the portable
+  # bound, and a refusal here is far better than a socket we cannot clean up.
+  [ "${#sock}" -le 104 ] || die "the socket path is too long (${#sock} chars; the limit is 104):
+  $sock
+  Set XDG_RUNTIME_DIR to a shorter directory and try again."
+
   # Nothing to open without a surface to open it in, so this one aborts.
   load_backend || exit 1
 
@@ -326,27 +377,36 @@ cmd_open() {
   [ "${#files_arr[@]}" -gt 0 ] \
     || die "no files to open for $tour (workspace root: $wsroot)"
 
-  sock="${TMPDIR:-/tmp}/walkthrough-$$.sock"; rm -f "$sock"
+  # The dialog channel (#21). Created here — same actor, same moment, same
+  # failure path as the socket — because the plugin cannot decide whether its
+  # own directory is trustworthy and this CLI already has.
+  #
+  # rm -f first: a stale FIFO from a dead session is never adopted, it is
+  # replaced. mkfifo refuses to overwrite, so without this an abandoned FIFO
+  # would fail every subsequent open.
+  fifo="$STATE_DIR/dialog-$$.fifo"; rm -f "$fifo"
+  ( umask 077; mkfifo -m 600 "$fifo" ) || die "cannot create the dialog channel: $fifo"
+
   # The player is pinned to the same workspace root everything above resolved
   # against — see wt_nvim_cmd.
   handle="$(backend_open "$(wt_nvim_cmd "$wsroot" "$sock" ${files_arr[@]+"${files_arr[@]}"})")" \
-    || die "backend failed to open a surface"
+    || { rm -f "$fifo"; die "backend failed to open a surface"; }
 
   # Readiness is the socket, never the shell prompt. 300 tries (~9s) matches
   # the measured worst-case nvim startup time (Task 7); do not lower it.
   wt_wait_for_socket "$sock" 300 \
-    || { backend_close "$handle"; die "nvim never came up on $sock (surface $handle)"; }
+    || { backend_close "$handle"; rm -f "$fifo"; die "nvim never came up on $sock (surface $handle)"; }
 
   # WALKTHROUGH_CLI is the absolute path to this running CLI (derived from
   # $ROOT, not $0, which may be relative). M.close() prefers it over a PATH
   # lookup so teardown works even when bin/ was never put on PATH — putting
   # it on PATH is documented as optional, so the plugin cannot depend on it.
   nvim --server "$sock" --remote-expr "$(open_expr "$tourabs" "$handle")" >/dev/null \
-    || { backend_close "$handle"; die "failed to render the tour (surface $handle)"; }
+    || { backend_close "$handle"; rm -f "$fifo"; die "failed to render the tour (surface $handle)"; }
 
   # Absolute, so `reload` from any directory targets the tour that is actually
   # playing rather than resolving the name against the wrong CWD.
-  state_write "$BACKEND" "$handle" "$sock" "$tourabs"
+  state_write "$BACKEND" "$handle" "$sock" "$tourabs" "$fifo"
   echo "$handle"; echo "$sock"
 }
 
@@ -462,8 +522,70 @@ cmd_close() {
     echo "  backend: $ST_backend   handle: $ST_handle" >&2
     echo "  Close it by hand; the walkthrough's own state has been cleared." >&2
   fi
-  rm -f "$STATE" "$ST_socket"
+  rm -f "$STATE" "$ST_socket" "$ST_dialog"
   return "$rc"
+}
+
+# `await` hides the transport, on purpose. Teaching SKILL.md to run
+# `head -1 < $FIFO` would weld the mechanism into a file that cannot be changed
+# without re-teaching every installed agent; behind a verb, the transport is one
+# function here (docs/dialog-design.md § Decisions, OQ-1).
+#
+# The default budget is 90s because the agent runs this inside a tool call and
+# the common harness default for one is 120s. A longer default would be killed
+# by the harness instead of returning its own honest "nobody asked", and a
+# killed call tells the agent nothing.
+cmd_await() {
+  local budget=90
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --timeout)
+        shift; budget="${1:-}"
+        [[ "$budget" =~ ^[0-9]+$ ]] || die "await --timeout takes whole seconds (got: $budget)"
+        [ "$budget" -ge 1 ] && [ "$budget" -le 3600 ] \
+          || die "await --timeout must be between 1 and 3600 seconds (got: $budget)"
+        ;;
+      *) die "await takes --timeout <seconds> (got: $1)" ;;
+    esac
+    shift
+  done
+  with_state
+  [ -n "$ST_dialog" ] \
+    || die "this walkthrough has no dialog channel (reopen it with this CLI)"
+  [ -p "$ST_dialog" ] || die "the dialog channel is missing: $ST_dialog"
+  # -l propagates the script's exit status, so 4 ("nobody asked") reaches the
+  # agent as 4 rather than as a generic failure.
+  nvim --headless --clean -l "$ROOT/lua/walkthrough/await.lua" \
+    "$ST_dialog" "$((budget * 1000))"
+}
+
+# The answer crosses as base64 behind a FIXED verb — never an expression.
+# `walkthrough step` used to interpolate its argument, so
+# `walkthrough step '<any vimscript>'` ran in the tour's nvim; that is the
+# precedent this is written against, and an answer is strictly more dangerous
+# because it is agent-authored text rather than a number.
+cmd_answer() {
+  local nonce="" text bytes
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --nonce) shift; nonce="${1:-}" ;;
+      *) die "answer takes --nonce <nonce>, with the answer on stdin (got: $1)" ;;
+    esac
+    shift
+  done
+  [ -n "$nonce" ] || die "answer needs --nonce <nonce> (it is in the question)"
+  # Past this test the nonce is provably [A-Za-z0-9-], so it cannot close a
+  # quote or introduce a token — the same argument cmd_step makes for its
+  # integer, and stronger than escaping for the same reason.
+  case "$nonce" in *[!A-Za-z0-9-]*) die "that is not a nonce: $nonce" ;; esac
+  with_state
+  text="$(cat)"
+  [ -n "$text" ] || die "the answer is empty (it is read from stdin)"
+  bytes="$(printf %s "$text" | wc -c | tr -d ' ')"
+  [ "$bytes" -le 16384 ] || die "the answer is too long ($bytes bytes; the limit is 16384)"
+  remote_expr "$(printf "luaeval('%s', ['%s','%s'])" \
+    '(function(a) local d = vim.base64.decode require("walkthrough")._answer(d(a[1]), d(a[2])) return 1 end)(_A)' \
+    "$(b64 "$nonce")" "$(b64 "$text")")"
 }
 
 usage() {
@@ -474,6 +596,9 @@ walkthrough — play guided code tours in nvim
   walkthrough step <+1|-1|N>       move along the narrative
   walkthrough reload [tour.tour]   re-render after files changed on disk
   walkthrough close                end the walkthrough
+  walkthrough await [--timeout N]  wait for a question from the walkthrough
+                                   (exit 4 = nobody asked; default 90s)
+  walkthrough answer --nonce N     answer the waiting question (read from stdin)
   walkthrough list [dir]           list tours (default: <workspace root>/.tours/)
   walkthrough validate <tour>...   exit 0 only if every tour is playable,
                                    reporting the line each pattern resolved to
@@ -502,6 +627,8 @@ case "${1:-}" in
   step) shift; cmd_step "$@" ;;
   reload) shift; cmd_reload "$@" ;;
   close) shift; cmd_close "$@" ;;
+  await) shift; cmd_await "$@" ;;
+  answer) shift; cmd_answer "$@" ;;
   list) shift; cmd_list "$@" ;;
   validate) shift; cmd_validate "$@" ;;
   schema) cmd_schema ;;
@@ -513,9 +640,21 @@ case "${1:-}" in
   # <leader>aq firing this and the backend reaching the multiplexer. The
   # backend's 2 is folded into 0 so this arm exits the way every other command
   # does — see the contract in backends/common.sh.
+  #
+  # The trailing "self" is the deliberate-self-close bypass both backends'
+  # guards look for (backends/cmux.sh and backends/tmux.sh, backend_close):
+  # this IS the plugin asking to close the surface it is itself running in
+  # ($handle here is $CMUX_SURFACE_ID or the caller's tmux window, inherited
+  # by the walkthrough's own nvim from the surface it was opened in), which
+  # is legitimate and is the entire purpose of this arm. It is written as a
+  # literal ONLY here — this is the one call site in the whole CLI that ever
+  # passes a second argument to backend_close — so `cmd_close`, which closes
+  # a surface named by a state file from wherever it happens to be run, has
+  # no way to acquire the bypass by accident; see `cmd_close` above, whose
+  # call `backend_close "$ST_handle"` has no second argument at all.
   _close_surface)
     shift; WALKTHROUGH_BACKEND="${1:-}"; load_backend || exit 1
-    backend_close "${2:-}"; _rc=$?
+    backend_close "${2:-}" self; _rc=$?
     [ "$_rc" = "${WT_CLOSE_GONE:-2}" ] && _rc=0
     exit "$_rc"
     ;;

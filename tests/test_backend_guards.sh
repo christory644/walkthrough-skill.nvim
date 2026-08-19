@@ -105,6 +105,53 @@ suite cmux close-surface "$CALLER_UUID" "$OTHER_UUID" "surface:19"
 suite tmux kill-window   "@1"           "@7"          "session:1"
 
 # ---------------------------------------------------------------------------
+# The deliberate self-close bypass: $2 = "self" to backend_close, written at
+# exactly one call site in the whole CLI -- bin/walkthrough's `_close_surface`
+# dispatch arm, which exists only so <leader>aq can close the surface its own
+# nvim is running in (see the "the caller's own handle" case in `suite` above,
+# and the comment on backend_close in each backends/*.sh). This is the OTHER
+# half of that guard's contract, and both halves have to hold for the fix to
+# be correct rather than merely permissive:
+#
+#   * marked "self", the caller's own handle must now be CLOSED -- this is
+#     the bug (#21): before the fix, <leader>aq's own call was refused by the
+#     identical check that protects `cmd_close`, because the walkthrough's own
+#     nvim inherits $CMUX_SURFACE_ID / a $TMUX_PANE resolving to the window it
+#     runs in, so the handle it asks to close IS the caller's.
+#   * unmarked, `cmd_close`'s protection must be untouched -- already covered
+#     above by "the caller's own handle", which never passes "self" and must
+#     keep refusing. That assertion is what makes this one mean anything: a
+#     backend_close that ignored $2 entirely and always allowed the caller's
+#     own handle would pass THIS suite while reopening the bug the guard
+#     exists for.
+self_close() { # $1 backend, $2 destructive verb, $3 caller handle
+  local backend="$1" verb="$2" caller="$3" rc
+  echo "== $backend: the deliberate self-close bypass"
+  : > "$CALLS"
+  rc="$(
+    export STUB_CALLER="$caller"
+    case "$backend" in
+      cmux) export CMUX_BIN="$TMP/rec" CMUX_SURFACE_ID="$caller" ;;
+      tmux) export TMUX_BIN="$TMP/rec" TMUX_PANE="%1" ;;
+    esac
+    . "./backends/common.sh"
+    # shellcheck source=/dev/null
+    . "./backends/$backend.sh"
+    backend_close "$caller" self >/dev/null 2>&1
+    echo $?
+  )"
+  if [ "$rc" != 0 ]; then
+    bad "$backend: self-close of the caller's own handle was refused (rc=$rc), wanted 0"
+  elif ! grep -q -- "$verb" "$CALLS" 2>/dev/null; then
+    bad "$backend: self-close returned 0 but never ran $verb [$(tr '\n' ';' < "$CALLS")]"
+  else
+    ok "$backend: self-close (\$2=self) on the caller's own handle IS permitted ($verb was run)"
+  fi
+}
+self_close cmux close-surface "$CALLER_UUID"
+self_close tmux kill-window   "@1"
+
+# ---------------------------------------------------------------------------
 # What backend_close REPORTS (#29)
 #
 # `walkthrough close` runs long after the reader has usually closed the surface

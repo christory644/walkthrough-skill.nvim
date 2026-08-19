@@ -124,6 +124,57 @@ the previous walkthrough back (on the same step) if the new one will not open.
 60 measured at ~1.8 s of wall clock, which is shorter than a cold nvim start
 with a real configuration.
 
+**`walkthrough await` is an `nvim -l` reader, not `timeout N head -1 < fifo`.**
+Issue #21 and `docs/design.md` both describe the `head` shape. The reason it is
+wrong is **macOS has no `timeout(1)`**, so a bounded read is not spellable in
+portable shell — that is sufficient on its own. A Lua reader also buys exact
+budget control and survives a stray open-close-without-write, which `head -1`
+does not.
+
+*An earlier draft of this note gave a second reason: that bash's `exec 3<>fifo`
+opens the FIFO `O_RDWR` and therefore measures as no reader to a non-blocking
+writer. **That was measured during this build and is false** — an `O_RDWR`
+holder does count as a reader, verified in bash, in nvim, and via a raw open.
+The claim is recorded here only so nobody reinstates it.* `O_RDONLY|O_NONBLOCK`
+remains the right choice because it returns immediately rather than blocking in
+`open()` until a writer appears, and because it does not also hold the reader
+open as a writer on its own FIFO — not because it is the only shape that works.
+
+**Nothing probes the dialog FIFO for liveness.** The reason is that a probe
+**buys nothing**: `O_WRONLY|O_NONBLOCK` makes liveness and delivery the same
+syscall — the open either is `ENXIO` or is the write — so a separate probe is a
+second fact that can disagree with the first. This is why OQ-3's auto-send retry
+tick *is* a send attempt.
+
+*A bare probe does end a `head -1 < fifo` reader with an empty, successful read
+— measured — but it does **not** end `await.lua`, which keeps waiting and still
+delivers the next real question whole. So "a probe would break our reader" is
+not the justification; the one above is. It also means OQ-3's "beat to cancel"
+could have been a literal countdown; the standing notice is a choice (the whole
+pending window is cancellable, and no probe means nothing to disagree with the
+send), not something physics forced.*
+
+**The dialog buffer is not in `state.touched`.** `docs/dialog-design.md` § 3
+says it should be, so that `teardown` finds it. It is closed explicitly from
+`teardown` instead — the one place it is closed — because `reload` runs
+`silent! edit!` over every buffer in `state.touched`, which is wrong for a
+`buftype=prompt` buffer and would destroy a transcript the reload was very
+likely caused by. So `M.reload` does not close it at all: it keeps the dialog
+and calls `dialog.on_reload`, which notes the change in the transcript. An
+answer that rewrites the tour goes through `reload`; the dialog has to survive
+it.
+
+**A socket path over 104 characters is refused, not truncated.** Past that
+length, nvim silently truncates the path to fit `sun_path` and binds the socket
+somewhere else — dropping the last path component — while still reporting the
+path it was given as `v:servername`. RPC connects either way, so it looks like
+success from every angle except the one that matters: the socket would not
+actually be inside `STATE_DIR`, whose ownership `cmd_open` checked, and `close`
+would `rm -f` a path that deletes nothing. `cmd_open` measures `${#sock}`
+against 104 (macOS's `sun_path` limit; Linux allows 108, so 104 is the portable
+bound) before ever calling nvim, and dies with the path and a suggestion to set
+a shorter `$XDG_RUNTIME_DIR` rather than let the mismatch happen silently.
+
 ## Verified, not assumed
 
 Two claims the plan makes as reasoning were later measured, and both hold: a

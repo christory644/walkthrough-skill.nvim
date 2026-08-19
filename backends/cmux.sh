@@ -81,7 +81,7 @@ cmux_surface_state() { # $1 = surface uuid
   esac
 }
 
-backend_close() {
+backend_close() { # $1 = surface uuid, $2 = "self" -- see the guard below
   # Never hand cmux an empty or malformed surface argument. `--surface` is an
   # OPTIONAL flag (`cmux close-surface --help`), so an empty one does not fail
   # -- it falls through to whatever cmux considers the current surface and
@@ -91,10 +91,37 @@ backend_close() {
   # success.
   cmux_is_surface_id "$1" || return 1
 
-  # And never the caller's own surface. $CMUX_SURFACE_ID is the tab the
-  # session driving us is running in; closing it kills that session mid-call.
-  # A well-formed UUID is not enough of a check when it is THAT UUID.
-  if [ -n "${CMUX_SURFACE_ID:-}" ] && [ "$1" = "$CMUX_SURFACE_ID" ]; then
+  # And never the caller's own surface -- UNLESS the caller is $2 = "self",
+  # its way of saying closing itself is deliberately the point.
+  #
+  # $CMUX_SURFACE_ID is the tab the session driving us is running in, so
+  # ordinarily "$1 = $CMUX_SURFACE_ID" means a stale or malicious state file
+  # named the surface a person is running `walkthrough close` FROM, and
+  # closing it would kill that session mid-command. That is `cmd_close`
+  # (bin/walkthrough), and it must keep being refused -- its one call site
+  # passes a single argument, so $2 is always empty there and this guard
+  # always applies to it.
+  #
+  # But `$1 = $CMUX_SURFACE_ID` is ALSO exactly what a legitimate self-close
+  # looks like: <leader>aq runs the plugin's M.close(), which jobstarts
+  # `walkthrough _close_surface cmux <handle>` from INSIDE the walkthrough's
+  # own nvim -- and that nvim inherited $CMUX_SURFACE_ID from the tab it is
+  # running in, which IS the surface being asked to close. Before this fix,
+  # the guard could not tell that call apart from the one above and refused
+  # it too (observed: "walkthrough: refusing to close the calling surface",
+  # the identical UUID on both sides), so <leader>aq cleaned up the state and
+  # left the tab, and nvim inside it, running. Proof it was only this guard:
+  # the identical close-surface argv, run from a different shell, exits 0.
+  #
+  # So the bypass is a literal, "self", written at exactly one call site --
+  # bin/walkthrough's `_close_surface` dispatch arm -- rather than an
+  # environment variable (which the caller's own shell could set, by
+  # accident or otherwise) or a flag `cmd_close` might one day be tempted to
+  # pass through. There is nothing for `cmd_close` to acquire by accident:
+  # it would have to be edited to pass a second argument it has no reason to
+  # pass.
+  if [ "${2:-}" != self ] \
+     && [ -n "${CMUX_SURFACE_ID:-}" ] && [ "$1" = "$CMUX_SURFACE_ID" ]; then
     echo "walkthrough: refusing to close the calling surface ($1)" >&2
     return 1
   fi

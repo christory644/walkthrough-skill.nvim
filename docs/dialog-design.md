@@ -1,7 +1,8 @@
 # The in-nvim dialog — design
 
-**Status:** ruled. All six open questions were decided by the owner on
-2026-08-17; see § Decisions. Ready to become an implementation plan.
+**Status:** shipped. All six open questions were decided by the owner on
+2026-08-17 (see § Decisions) and the twelve-task implementation plan they
+produced has landed, closing #21.
 **Date:** 2026-08-14
 **Scope:** issue #21. `docs/design.md` § "Dialog — the core interaction" is the
 parent document; this one supersedes it wherever the two disagree, because parts
@@ -270,7 +271,9 @@ socket path is a capability. Today it sits at a predictable name in a shared
 temp directory, and the dialog raises what it is worth — it becomes the channel
 that writes the text the reader reads as "the agent's answer". **Moving the
 socket into `STATE_DIR` alongside the FIFO should be a precondition of shipping
-this**, not a follow-up.
+this**, not a follow-up. **Done, as #31**: `cmd_open` now places the socket at
+`$STATE_DIR/sock-$$`, inside the same ownership-checked directory as the FIFO
+and the state file.
 
 Two smaller rules: the dialog buffer is `nofile`/`noswapfile` and is never
 written to disk, so the transcript cannot become a file an agent later reads as
@@ -477,5 +480,5 @@ Two things this document treats as **preconditions rather than open questions**,
 flagged here so they are not missed: issue #15 (the state directory's ownership
 is unchecked, and the FIFO leans on that directory harder than the state file
 does) — **now fixed and closed** — and moving the nvim socket out of the shared
-temp directory into `STATE_DIR` (§ 5), **which is still outstanding**. Neither
-is optional once a live channel runs through that directory.
+temp directory into `STATE_DIR` (§ 5) — **also now fixed and closed, as #31**.
+Neither was optional once a live channel ran through that directory.
