@@ -148,7 +148,12 @@ wt_require_backend() {
 # The shape every backend uses, and the one a third should copy:
 #
 #   1. refuse a handle that is not well-formed, and refuse the caller's own
-#      surface, BEFORE the multiplexer is invoked (tests/test_backend_guards.sh);
+#      surface, BEFORE the multiplexer is invoked (tests/test_backend_guards.sh)
+#      -- UNLESS $2 = "self", which both backends honour as a deliberate
+#      self-close and which only bin/walkthrough's `_close_surface` dispatch
+#      arm ever passes (see the comment there, and in each backend's
+#      backend_close). `cmd_close` never passes a second argument, so that
+#      guard always applies to it;
 #   2. attempt the close; if the multiplexer accepted it, return 0;
 #   3. only then ask the multiplexer's inventory whether that surface is still
 #      there. Absent -> 2. Present -> 1. Cannot tell -> 1.

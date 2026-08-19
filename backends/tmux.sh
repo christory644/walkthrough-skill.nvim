@@ -140,7 +140,7 @@ tmux_window_exists() { # $1 = window id
   esac
 }
 
-backend_close() {
+backend_close() { # $1 = window id, $2 = "self" -- see the guard below
   # Never hand tmux an empty or malformed target. This is not hypothetical:
   # measured on tmux 3.6a, `kill-window -t ''` killed the session's remaining
   # window and EXITED 0 -- the destructive case reports success. A bogus but
@@ -149,11 +149,36 @@ backend_close() {
   # ever invoked.
   tmux_is_window_id "$1" || return 1
 
-  # And never close the window we were called from. $TMUX_PANE belongs to the
-  # session driving us; killing it takes the caller down with it.
-  if [ -n "${TMUX_PANE:-}" ]; then
-    self="$("$TMUX_BIN" display-message -p -t "$TMUX_PANE" '#{window_id}' 2>/dev/null)"
-    [ "$1" = "$self" ] && {
+  # And never close the window we were called from -- UNLESS the caller is
+  # $2 = "self", its way of saying closing itself is deliberately the point.
+  #
+  # $TMUX_PANE belongs to the session driving us, so ordinarily the window it
+  # resolves to matching $1 means a stale or malicious state file named the
+  # window a person is running `walkthrough close` FROM, and killing it would
+  # take that session down mid-command. That is `cmd_close` (bin/walkthrough),
+  # and it must keep being refused -- its one call site passes a single
+  # argument, so $2 is always empty there and this guard always applies to it.
+  #
+  # But "$1 = the caller's window" is ALSO exactly what a legitimate
+  # self-close looks like: <leader>aq runs the plugin's M.close(), which
+  # jobstarts `walkthrough _close_surface tmux <handle>` from INSIDE the
+  # walkthrough's own nvim -- and that nvim inherited $TMUX_PANE from the
+  # pane it is running in, whose window IS the one being asked to close.
+  # Unguarded against, that call would be refused the same way the cmux
+  # backend's identical guard was measured refusing it (see cmux.sh,
+  # backend_close) -- <leader>aq would clean up the state and leave the
+  # window, and nvim inside it, running.
+  #
+  # So the bypass is a literal, "self", written at exactly one call site --
+  # bin/walkthrough's `_close_surface` dispatch arm -- rather than an
+  # environment variable (which the caller's own shell could set, by
+  # accident or otherwise) or a flag `cmd_close` might one day be tempted to
+  # pass through. There is nothing for `cmd_close` to acquire by accident: it
+  # would have to be edited to pass a second argument it has no reason to
+  # pass.
+  if [ "${2:-}" != self ] && [ -n "${TMUX_PANE:-}" ]; then
+    self_win="$("$TMUX_BIN" display-message -p -t "$TMUX_PANE" '#{window_id}' 2>/dev/null)"
+    [ "$1" = "$self_win" ] && {
       echo "walkthrough: refusing to close the calling window ($1)" >&2
       return 1
     }

@@ -177,7 +177,66 @@ if wait_focus "$away"; then ok "teardown lands where the reader actually was"
 else bad "landed on $(focused), expected the wandered-to window $away"; fi
 "$TM" kill-window -t "$away" 2>/dev/null
 
-# What backend_close REFUSES is not tested here. It is the same rule for every
+# ---------------------------------------------------------------------------
+# Self-close: the <leader>aq path (bin/walkthrough's `_close_surface` arm),
+# end to end, on a real window. The walkthrough's own nvim inherits
+# $TMUX_PANE from the pane it runs in, so when the plugin asks to close ITS
+# OWN window, $1 legitimately names the window $TMUX_PANE resolves to -- the
+# exact shape backend_close's guard exists to refuse for `cmd_close`. Before
+# the fix this landed in, that guard could not tell the two apart and
+# refused BOTH, which is why this is exercised live rather than only through
+# the stubbed suite: a window that is really told to close itself must
+# really go.
+echo "== close, the window closing itself (the <leader>aq path)"
+# A socket of its own, not a reuse of $SOCK: kill-window does not give nvim a
+# chance to remove its own socket file on the way out, and a stale file left
+# behind by an earlier window in this suite made THIS window's nvim fail to
+# bind and die before the close under test ever ran -- a flake with nothing
+# to do with the guard, chased down by watching it happen.
+SOCK4="${TMPDIR:-/tmp}/wt-tmux-self-$$.sock"; rm -f "$SOCK4"
+h4="$(backend_open "$(wt_nvim_cmd "$PWD" "$SOCK4" tests/fixtures/alpha.txt)")"
+wait_focus "$h4" || bad "focus did not move to the self-close window"
+wt_wait_for_socket "$SOCK4" 300 || bad "nvim never came up in the self-close window"
+selfpane="$("$TM" list-panes -t "$h4" -F '#{pane_id}' 2>/dev/null | head -1)"
+if [ -z "$selfpane" ]; then
+  bad "could not find a pane inside the self-close window"
+else
+  # Without "self": the identical shape the plugin relies on being allowed
+  # must still be REFUSED when nothing marks it deliberate -- cmd_close's
+  # protection, exercised against a real window rather than the stub.
+  before_self="$(windows)"
+  ( TMUX_PANE="$selfpane" backend_close "$h4" ) >/dev/null 2>&1
+  rc_noself=$?
+  if [ "$rc_noself" = 0 ]; then
+    bad "a self-shaped close without 'self' was accepted (rc=0) -- the guard did not fire"
+  elif [ "$(windows)" != "$before_self" ]; then
+    bad "a self-shaped close without 'self' changed the window set anyway"
+  else
+    ok "a self-shaped close without 'self' is still refused (rc=$rc_noself, window untouched)"
+  fi
+
+  # With "self": the same shape, the same window, and this time it is the
+  # bypass bin/walkthrough's _close_surface arm actually passes.
+  ( TMUX_PANE="$selfpane" backend_close "$h4" self ) >/dev/null 2>&1
+  rc_self=$?
+  if [ "$rc_self" = 0 ]; then ok "self-close (\$2=self) reports 0"
+  else bad "self-close (\$2=self) reported $rc_self, wanted 0"; fi
+
+  i=0
+  while "$TM" list-windows -a -F '#{window_id}' 2>/dev/null | grep -qxF -- "$h4" && [ "$i" -lt 25 ]; do
+    sleep 0.2; i=$((i + 1))
+  done
+  if "$TM" list-windows -a -F '#{window_id}' 2>/dev/null | grep -qxF -- "$h4"; then
+    bad "the window was told to close itself but tmux still lists it ($h4)"
+  else
+    ok "the window actually closed itself ($h4 is gone)"
+  fi
+fi
+"$TM" kill-window -t "$h4" 2>/dev/null   # safety net if the assertions above failed
+rm -f "$SOCK4"
+
+# What backend_close REFUSES otherwise is not tested here (the self case
+# above aside). It is the same rule for every
 # backend, it needs no multiplexer to check, and duplicating it per suite means
 # two places to update and one of them going stale -- see
 # tests/test_backend_guards.sh, which runs everywhere including CI.
